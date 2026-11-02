@@ -12,13 +12,13 @@ import {
 } from "./types.js";
 
 /**
- * OpenAI's current transcription model. One HTTPS multipart POST, no SDK and
- * no local decode, so it fits a Vercel function. `json` returns `text` and
- * `languages`. OGG, MP3, MP4, M4A, WAV, and WebM cover Telegram voice
- * (OGG/Opus), common audio, and video notes (MP4).
+ * xAI speech-to-text. One HTTPS multipart POST, no SDK and no local decode,
+ * so it fits a Vercel function. The response includes `text` and `language`.
+ * OGG, MP3, MP4, M4A, WAV, and WebM cover Telegram voice (OGG/Opus), common
+ * audio, and video notes (MP4).
  */
-export const OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions";
-export const OPENAI_TRANSCRIBE_MODEL = "gpt-transcribe";
+export const XAI_STT_URL = "https://api.x.ai/v1/stt";
+export const XAI_TRANSCRIBE_MODEL = "grok-voice-transcribe-2.0";
 
 /** Wall clock for every speech file on one update. Leaves room inside the 60s function. */
 export const SPEECH_BUDGET_MS = 35_000;
@@ -101,7 +101,7 @@ async function transcribeOne(
   if (!downloaded.ok) return failure(downloaded.error);
   if (now() >= deadline) return failure("timeout");
 
-  const provider = await callOpenAI(options.fetchImpl, options.speech.apiKey, downloaded.bytes, format);
+  const provider = await callXaiStt(options.fetchImpl, options.speech.apiKey, downloaded.bytes, format);
   if (!provider.ok) return failure(provider.error);
   const transcript = cleanText(provider.text).trim();
   if (!transcript) return failure("empty");
@@ -136,21 +136,21 @@ async function downloadSpeech(
   }
 }
 
-async function callOpenAI(
+async function callXaiStt(
   fetchImpl: typeof fetch,
   apiKey: string,
   bytes: Uint8Array,
   format: { filename: string; mime: string },
 ): Promise<{ ok: true; text: string; language: string | null } | { ok: false; error: TranscriptError }> {
   const form = new FormData();
+  // xAI requires the file field last in the multipart body.
+  form.set("model", XAI_TRANSCRIBE_MODEL);
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   form.set("file", new File([copy], format.filename, { type: format.mime }));
-  form.set("model", OPENAI_TRANSCRIBE_MODEL);
-  form.set("response_format", "json");
   let response: Response;
   try {
-    response = await fetchImpl(OPENAI_TRANSCRIPTIONS_URL, {
+    response = await fetchImpl(XAI_STT_URL, {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}` },
       body: form,
@@ -180,6 +180,7 @@ function parseProviderBody(data: unknown): { text: string; language: string | nu
 }
 
 function languageOf(record: Record<string, unknown>): string | null {
+  if (typeof record.language === "string") return cleanLanguage(record.language);
   const languages = record.languages;
   if (Array.isArray(languages)) {
     for (const item of languages) {
@@ -192,11 +193,10 @@ function languageOf(record: Record<string, unknown>): string | null {
       if (code) return code;
     }
   }
-  if (typeof record.language === "string") return cleanLanguage(record.language);
   return null;
 }
 
-/** ISO 639 code (`en`, `zh-cn`) or a whisper language name (`english`). */
+/** BCP-47 / ISO 639 code (`en`, `es-mx`) or a language name (`english`). */
 function cleanLanguage(raw: string): string | null {
   const value = raw.trim().toLowerCase();
   if (!/^[a-z][a-z0-9-]{0,31}$/.test(value)) return null;

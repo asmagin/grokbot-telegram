@@ -186,7 +186,7 @@ async function handleClaimedUpdate(
         shortTerm,
         burstMessages: [],
         transcripts,
-    greet: true,
+        greet: true,
       }, "background");
     }
   }

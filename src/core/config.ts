@@ -47,7 +47,7 @@ export interface Config {
   forwardBurstMs: number;
   allowInsecureWebhook: boolean;
   /**
-   * Inbound speech-to-text. Null when `OPENAI_API_KEY` is unset, which leaves
+   * Inbound speech-to-text. Null when `XAI_API_KEY` is unset, which leaves
    * wake attachments exactly as they are without transcription.
    */
   speech: SpeechConfig | null;
@@ -55,7 +55,7 @@ export interface Config {
   problems: string[];
 }
 
-/** OpenAI transcription, used only after the operator sets a key and the clip fits these caps. */
+/** xAI speech-to-text, used only after the operator sets a key and the clip fits these caps. */
 export interface SpeechConfig {
   apiKey: string;
   /** Inclusive maximum of the Telegram duration field, in seconds. */
@@ -64,7 +64,7 @@ export interface SpeechConfig {
   maxBytes: number;
 }
 
-export const MIN_OPENAI_KEY_LENGTH = 20;
+export const MIN_XAI_KEY_LENGTH = 20;
 export const DEFAULT_TRANSCRIBE_MAX_SECONDS = 60;
 export const DEFAULT_TRANSCRIBE_MAX_BYTES = 2_000_000;
 export const MAX_TRANSCRIBE_SECONDS = 180;
@@ -266,10 +266,10 @@ export function loadConfig(env: EnvSource): Config {
  * only after the key is accepted; unset caps use the defaults.
  */
 function loadSpeech(env: EnvSource, problems: string[]): SpeechConfig | null {
-  const apiKey = readString(env, "OPENAI_API_KEY");
+  const apiKey = readString(env, "XAI_API_KEY");
   if (!apiKey) return null;
-  if (apiKey.length < MIN_OPENAI_KEY_LENGTH) {
-    problems.push("OPENAI_API_KEY");
+  if (apiKey.length < MIN_XAI_KEY_LENGTH) {
+    problems.push("XAI_API_KEY");
     return null;
   }
   const maxBytes = readInt(env, "TRANSCRIBE_MAX_BYTES", DEFAULT_TRANSCRIBE_MAX_BYTES);

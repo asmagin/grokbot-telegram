@@ -258,19 +258,19 @@ Each attachment has `kind`, `mime_type`, `file_name`, `file_size`, `width`, `hei
 
 ### Transcripts
 
-Set `OPENAI_API_KEY` to turn on speech-to-text. Leave it unset and attachments stay exactly as they are today: no `transcript` field. The bridge then sends voice notes, audio, and video notes that fit `TRANSCRIBE_MAX_SECONDS` (default 60, clamped to 1–180) and `TRANSCRIBE_MAX_BYTES` (default 2000000, clamped to 1024–4000000) to OpenAI's transcription API (`gpt-transcribe`, one HTTPS multipart POST to `https://api.openai.com/v1/audio/transcriptions`). That call fits a Vercel function: there is no local model and no ffmpeg. The function's `maxDuration` is 60 seconds, and the bridge stops the whole transcription pass at 35 seconds so the webhook can still answer Telegram.
+Set `XAI_API_KEY` to turn on speech-to-text. Leave it unset and attachments stay exactly as they are today: no `transcript` field. The bridge then sends voice notes, audio, and video notes that fit `TRANSCRIBE_MAX_SECONDS` (default 60, clamped to 1–180) and `TRANSCRIBE_MAX_BYTES` (default 2000000, clamped to 1024–4000000) to xAI's speech-to-text API (`grok-voice-transcribe-2.0`, one HTTPS multipart POST to `https://api.x.ai/v1/stt`). That call fits a Vercel function: there is no local model and no ffmpeg. The function's `maxDuration` is 60 seconds, and the bridge stops the whole transcription pass at 35 seconds so the webhook can still answer Telegram. SpaceXAI Premium includes Grok API access; STT uses that API and is billed on the API side (about $0.10 per hour of audio), not from the Chat/Bot weekly usage pool.
 
 On those three kinds the attachment gains three fields:
 
 | Field | Meaning |
 | --- | --- |
 | `transcript` | Untrusted text, cleaned and capped at 4000 characters like `message.text`. Null when there is no text. |
-| `transcript_language` | The provider's language when it reported one (`en`, or a name such as `english`). Null when it did not. The first language is kept when it reports more than one. |
+| `transcript_language` | The provider's language when it reported one (a BCP-47 code such as `en` or `es-mx`). Null when it did not. |
 | `transcript_error` | Null when `transcript` is text. Otherwise `too_long`, `too_large`, `unavailable`, `fetch_failed`, `provider_error`, `timeout`, `empty`, or `unsupported`. |
 
-`message.text` stays the caption, which is empty for a voice note or a video note. The words are on `transcript`, not copied into `message.text` or into `short_term`. A later wake does not replay the transcript. A failure does not drop a wake that was already addressed: the file URL is still there, `transcript` is null, and `transcript_error` says why. A group voice note whose transcript fails is not a mention, so it does not wake the bot. Over the duration or size cap, the bridge does not download the file and does not call OpenAI. Types OpenAI does not take (for example `audio/aac` with no recognized extension) are `unsupported`. The key is redacted in logs. Logs record the kind, the byte size, the duration, and the reason, never the transcript.
+`message.text` stays the caption, which is empty for a voice note or a video note. The words are on `transcript`, not copied into `message.text` or into `short_term`. A later wake does not replay the transcript. A failure does not drop a wake that was already addressed: the file URL is still there, `transcript` is null, and `transcript_error` says why. A group voice note whose transcript fails is not a mention, so it does not wake the bot. Over the duration or size cap, the bridge does not download the file and does not call xAI. Types xAI does not take (for example `audio/aac` with no recognized extension) are `unsupported`. The key is redacted in logs. Logs record the kind, the byte size, the duration, and the reason, never the transcript.
 
-The owner adds `OPENAI_API_KEY` in the Vercel project's Environment Variables (the same place as the rest of `.env`), then redeploys. The caps can stay at the defaults.
+The owner creates an API key at https://console.x.ai, adds `XAI_API_KEY` in the Vercel project's Environment Variables (the same place as the rest of `.env`), then redeploys. The caps can stay at the defaults.
 
 ```bash
 curl -sS "$FILE_URL" -H "Authorization: Bearer $REPLY_TOKEN" -o photo.jpg
@@ -345,11 +345,11 @@ In a private chat, every message from an allowlisted sender or chat wakes the bo
 - starts with a command from `WAKE_COMMANDS`, such as `/ask` or `/ask@YourBot`, or
 - replies to one of the bot's own messages.
 
-A voice note or a video note cannot @mention the bot, and neither has a caption. When `OPENAI_API_KEY` is set, the bridge transcribes those two kinds in an allowlisted group and treats a transcript that contains the bot's username as a mention. The match is the username as a whole word, with or without a leading `@`, case insensitive. `addressed_how` stays `mention`. A display name is not matched, because the bridge does not know one and a common first name would wake on ordinary speech. A username shorter than five characters is not matched in speech. Pick a distinctive username: if the username is an ordinary word, every voice note that says that word wakes the bot.
+A voice note or a video note cannot @mention the bot, and neither has a caption. When `XAI_API_KEY` is set, the bridge transcribes those two kinds in an allowlisted group and treats a transcript that contains the bot's username as a mention. The match is the username as a whole word, with or without a leading `@`, case insensitive. `addressed_how` stays `mention`. A display name is not matched, because the bridge does not know one and a common first name would wake on ordinary speech. A username shorter than five characters is not matched in speech. Pick a distinctive username: if the username is an ordinary word, every voice note that says that word wakes the bot.
 
 Audio files are not addressed this way. They can carry an @mention in the caption, and a spoken name inside a song or a podcast should not override a caption that did not mention the bot. A failed, empty, or missing transcript does not count. With transcription off, a group voice note wakes the bot only the way any other group message does: a reply to the bot, or a command.
 
-Privacy mode is unchanged. Telegram still does not deliver a voice note while privacy is on, unless the note is a reply to the bot, a command, or the bot is an admin. Transcription cannot see a message Telegram withheld. With privacy off, every allowlisted voice note and video note is sent to OpenAI so the bridge can decide, including notes that do not mention the bot and therefore do not wake it. That is the cost of spoken mentions. The audio of an ordinary group text message, a photo, or an unaddressed audio file is not sent.
+Privacy mode is unchanged. Telegram still does not deliver a voice note while privacy is on, unless the note is a reply to the bot, a command, or the bot is an admin. Transcription cannot see a message Telegram withheld. With privacy off, every allowlisted voice note and video note is sent to xAI so the bridge can decide, including notes that do not mention the bot and therefore do not wake it. That is the cost of spoken mentions. The audio of an ordinary group text message, a photo, or an unaddressed audio file is not sent.
 
 The bridge keeps other group messages in a per-topic buffer (`CONTEXT_LIMIT`, 10 by default) and attaches them to the next wake as context. It ignores messages from other bots. In Telegram's default privacy mode the bot receives `/ask@YourBot`, replies to its own messages, and service messages. Turn privacy off with BotFather `/setprivacy`, or make the bot an admin, then remove the bot from the group and add it again.
 
@@ -402,9 +402,9 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | `FORWARD_BURST_MS` | no | Default `1500`. Clamped to 0-5000. Wait after a forward so the sender's following comment joins one wake. `0` wakes on each update immediately. |
 | `MAX_BODY_BYTES` | no | Default `1000000`, minimum 1024. Enforced while streaming, on every host. |
 | `MAX_MEDIA_BYTES` | no | Default `4000000`, minimum 1024, hard cap `4194304` (4 MiB). The multipart upload limit for `POST /send/media`, kept under Vercel's ~4.5 MB request body limit. Larger files use an https `url`. |
-| `OPENAI_API_KEY` | no | OpenAI API key for inbound speech-to-text. Unset leaves transcripts off. At least 20 characters. Add it in Vercel as an environment variable. The model is `gpt-transcribe`. |
-| `TRANSCRIBE_MAX_SECONDS` | no | Default `60`, clamped to 1–180. Used only when `OPENAI_API_KEY` is set. Voice, audio, and video notes longer than this are not transcribed (`transcript_error: "too_long"`). |
-| `TRANSCRIBE_MAX_BYTES` | no | Default `2000000`, clamped to 1024–4000000. Used only when `OPENAI_API_KEY` is set. Larger clips are not transcribed (`transcript_error: "too_large"`). |
+| `XAI_API_KEY` | no | xAI API key for inbound speech-to-text. Unset leaves transcripts off. At least 20 characters. Create it at https://console.x.ai and add it in Vercel. The model is `grok-voice-transcribe-2.0`. |
+| `TRANSCRIBE_MAX_SECONDS` | no | Default `60`, clamped to 1–180. Used only when `XAI_API_KEY` is set. Voice, audio, and video notes longer than this are not transcribed (`transcript_error: "too_long"`). |
+| `TRANSCRIBE_MAX_BYTES` | no | Default `2000000`, clamped to 1024–4000000. Used only when `XAI_API_KEY` is set. Larger clips are not transcribed (`transcript_error: "too_large"`). |
 | `ALLOW_INSECURE_WEBHOOK` | no | Default `false`. Allows an `http://` Grok webhook for local development. |
 
 ## Endpoints
@@ -460,4 +460,4 @@ npm run cf:deploy
 
 [MIT](LICENSE). Copyright grokbot-telegram contributors.
 
-- Speech bytes go to `https://api.openai.com/v1/audio/transcriptions` only when `OPENAI_API_KEY` is set, only for an allowlisted chat, and only for a voice, audio, or video note inside the duration and size caps. The request does not follow redirects. The key is not in the wake payload. Logs record the outcome, not the transcript and not the key.
+- Speech bytes go to `https://api.x.ai/v1/stt` only when `XAI_API_KEY` is set, only for an allowlisted chat, and only for a voice, audio, or video note inside the duration and size caps. The request does not follow redirects. The key is not in the wake payload. Logs record the outcome, not the transcript and not the key.

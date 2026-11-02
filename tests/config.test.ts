@@ -94,16 +94,16 @@ describe("public base url", () => {
 });
 
 describe("speech transcription config", () => {
-  it("stays off when the OpenAI key is unset, even if the caps are set", () => {
+  it("stays off when the xAI key is unset, even if the caps are set", () => {
     const config = loadConfig(testEnv({ TRANSCRIBE_MAX_SECONDS: "30", TRANSCRIBE_MAX_BYTES: "1000" }));
     expect(config.speech).toBeNull();
-    expect(config.problems).not.toContain("OPENAI_API_KEY");
+    expect(config.problems).not.toContain("XAI_API_KEY");
   });
 
   it("turns on with the key and uses the default caps", () => {
-    const config = loadConfig(testEnv({ OPENAI_API_KEY: "sk-test-openai-key-0123456789" }));
+    const config = loadConfig(testEnv({ XAI_API_KEY: "xai-test-api-key-0123456789" }));
     expect(config.speech).toEqual({
-      apiKey: "sk-test-openai-key-0123456789",
+      apiKey: "xai-test-api-key-0123456789",
       maxSeconds: DEFAULT_TRANSCRIBE_MAX_SECONDS,
       maxBytes: DEFAULT_TRANSCRIBE_MAX_BYTES,
     });
@@ -111,11 +111,11 @@ describe("speech transcription config", () => {
   });
 
   it("rejects a short key by name and clamps the caps", () => {
-    const short = loadConfig(testEnv({ OPENAI_API_KEY: "sk-too-short" }));
+    const short = loadConfig(testEnv({ XAI_API_KEY: "xai-short" }));
     expect(short.speech).toBeNull();
-    expect(short.problems).toContain("OPENAI_API_KEY");
+    expect(short.problems).toContain("XAI_API_KEY");
     const clamped = loadConfig(testEnv({
-      OPENAI_API_KEY: "sk-test-openai-key-0123456789",
+      XAI_API_KEY: "xai-test-api-key-0123456789",
       TRANSCRIBE_MAX_SECONDS: "9999",
       TRANSCRIBE_MAX_BYTES: "9",
     }));

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildDeps } from "../src/core/deps.js";
 import { handleRequest } from "../src/core/handler.js";
-import { OPENAI_TRANSCRIBE_MODEL, OPENAI_TRANSCRIPTIONS_URL, SPEECH_BUDGET_MS } from "../src/core/transcribe.js";
+import { XAI_TRANSCRIBE_MODEL, XAI_STT_URL, SPEECH_BUDGET_MS } from "../src/core/transcribe.js";
 import { TELEGRAM_GET_FILE_MAX_BYTES, type WakeEvent } from "../src/core/types.js";
 import {
   createFetchMock,
@@ -13,16 +13,16 @@ import {
   type RecordedCall,
 } from "./helpers.js";
 
-const OPENAI_KEY = "sk-test-openai-key-0123456789";
+const XAI_KEY = "xai-test-api-key-0123456789";
 
 function speechEnv(overrides: Record<string, string> = {}): Record<string, string> {
-  return testEnv({ OPENAI_API_KEY: OPENAI_KEY, ...overrides });
+  return testEnv({ XAI_API_KEY: XAI_KEY, ...overrides });
 }
 
 function speechApp(options: {
   env?: Record<string, string>;
   transcript?: string;
-  languages?: { code: string }[] | null;
+  language?: string | null;
   provider?: (call: RecordedCall) => Response | Promise<Response>;
   handler?: (call: RecordedCall) => Response | Promise<Response> | undefined;
   log?: (event: Record<string, unknown>) => void;
@@ -31,10 +31,10 @@ function speechApp(options: {
   const mock = createFetchMock(async (call) => {
     const custom = await options.handler?.(call);
     if (custom) return custom;
-    if (call.url === OPENAI_TRANSCRIPTIONS_URL) {
+    if (call.url === XAI_STT_URL) {
       if (options.provider) return options.provider(call);
       const body: Record<string, unknown> = { text: options.transcript ?? "hey testbot" };
-      if (options.languages !== null) body.languages = options.languages ?? [{ code: "en" }];
+      if (options.language !== null) body.language = options.language ?? "en";
       return Response.json(body);
     }
     if (call.url.endsWith("/getFile")) {
@@ -69,8 +69,8 @@ function wakes(calls: RecordedCall[]): WakeEvent[] {
     .map((call) => call.body as WakeEvent);
 }
 
-function openaiCalls(calls: RecordedCall[]): RecordedCall[] {
-  return calls.filter((call) => call.url === OPENAI_TRANSCRIPTIONS_URL);
+function xaiCalls(calls: RecordedCall[]): RecordedCall[] {
+  return calls.filter((call) => call.url === XAI_STT_URL);
 }
 
 function voice(overrides: Record<string, unknown> = {}) {
@@ -91,13 +91,13 @@ function groupMedia(updateId: number, extra: Record<string, unknown>) {
 }
 
 describe("inbound transcripts", () => {
-  it("leaves a voice note unchanged when the OpenAI key is unset", async () => {
+  it("leaves a voice note unchanged when the xAI key is unset", async () => {
     const app = speechApp({ env: testEnv({ TRANSCRIBE_MAX_SECONDS: "30" }) });
     await postUpdate(app.deps, app.tasks, dmUpdate("", 1, { text: undefined, voice: voice() }));
     const payload = wakes(app.calls)[0];
     expect(payload).toBeDefined();
     expect(payload?.message.attachments[0]).not.toHaveProperty("transcript");
-    expect(openaiCalls(app.calls)).toHaveLength(0);
+    expect(xaiCalls(app.calls)).toHaveLength(0);
     expect(app.calls.some((call) => call.url.endsWith("/getFile"))).toBe(false);
   });
 
@@ -121,42 +121,45 @@ describe("inbound transcripts", () => {
     expect(sticker).not.toHaveProperty("transcript");
     expect(payload.message.text).toBe("");
     expect(payload.untrusted_content_notice).toMatch(/transcript/);
-    expect(JSON.stringify(payload)).not.toContain(OPENAI_KEY);
-    expect(JSON.stringify(logs)).not.toContain(OPENAI_KEY);
+    expect(JSON.stringify(payload)).not.toContain(XAI_KEY);
+    expect(JSON.stringify(logs)).not.toContain(XAI_KEY);
     expect(JSON.stringify(logs)).not.toContain("hey testbot");
     expect(logs.some((event) => event.event === "transcribe" && event.reason === null && event.kind === "voice")).toBe(true);
 
-    const provider = openaiCalls(app.calls)[0]!;
+    const provider = xaiCalls(app.calls)[0]!;
     expect(provider.method).toBe("POST");
     expect(provider.redirect).toBe("manual");
-    expect(provider.headers.authorization).toBe(`Bearer ${OPENAI_KEY}`);
+    expect(provider.headers.authorization).toBe(`Bearer ${XAI_KEY}`);
     expect(provider.body).toBeInstanceOf(FormData);
     const form = provider.body as FormData;
-    expect(form.get("model")).toBe(OPENAI_TRANSCRIBE_MODEL);
-    expect(form.get("response_format")).toBe("json");
+    expect(form.get("model")).toBe(XAI_TRANSCRIBE_MODEL);
     const file = form.get("file");
     expect(file).toBeInstanceOf(File);
     expect((file as File).name).toBe("voice.ogg");
     expect((file as File).type).toBe("audio/ogg");
-    expect([...form.keys()].sort()).toEqual(["file", "model", "response_format"]);
+    expect([...form.keys()]).toEqual(["model", "file"]);
   });
 
-  it("cleans the transcript and caps it, and keeps a whisper language name", async () => {
-    const app = speechApp({
+  it("cleans the transcript and caps it, and keeps a BCP-47 language code", async () => {
+    const cleaned = speechApp({
       provider: () => Response.json({ text: `hey \u0007testbot\u202e ${"a".repeat(5000)}`, language: "English!" }),
     });
-    await postUpdate(app.deps, app.tasks, dmUpdate("", 3, { text: undefined, voice: voice() }));
-    const attachment = wakes(app.calls)[0]?.message.attachments[0];
+    await postUpdate(cleaned.deps, cleaned.tasks, dmUpdate("", 3, { text: undefined, voice: voice() }));
+    const attachment = wakes(cleaned.calls)[0]?.message.attachments[0];
     expect(attachment?.transcript?.startsWith("hey testbot ")).toBe(true);
     expect(attachment?.transcript?.includes("\u0007")).toBe(false);
     expect(attachment?.transcript?.includes("\u202e")).toBe(false);
     expect(attachment?.transcript?.length).toBe(4000);
     expect(attachment?.transcript_language).toBeNull();
+
+    const regional = speechApp({ language: "es-MX" });
+    await postUpdate(regional.deps, regional.tasks, dmUpdate("", 23, { text: undefined, voice: voice({ file_id: "voiceEs" }) }));
+    expect(wakes(regional.calls)[0]?.message.attachments[0]?.transcript_language).toBe("es-mx");
   });
 
   it("records a reason and still wakes when the provider fails", async () => {
     const refused = speechApp({
-      provider: () => Response.json({ error: { message: OPENAI_KEY } }, { status: 500 }),
+      provider: () => Response.json({ error: { message: XAI_KEY } }, { status: 500 }),
     });
     await postUpdate(refused.deps, refused.tasks, dmUpdate("", 4, { text: undefined, voice: voice() }));
     expect(wakes(refused.calls)[0]?.message.attachments[0]).toMatchObject({
@@ -164,7 +167,7 @@ describe("inbound transcripts", () => {
       transcript_language: null,
       transcript_error: "provider_error",
     });
-    expect(JSON.stringify(wakes(refused.calls)[0])).not.toContain(OPENAI_KEY);
+    expect(JSON.stringify(wakes(refused.calls)[0])).not.toContain(XAI_KEY);
 
     const timedOut = speechApp({
       provider: () => {
@@ -182,14 +185,14 @@ describe("inbound transcripts", () => {
     });
   });
 
-  it("skips the download when the clip is over a cap or a type OpenAI will not take", async () => {
+  it("skips the download when the clip is over a cap or a type xAI will not take", async () => {
     const tooLong = speechApp();
     await postUpdate(tooLong.deps, tooLong.tasks, dmUpdate("", 7, {
       text: undefined,
       voice: voice({ duration: 61 }),
     }));
     expect(wakes(tooLong.calls)[0]?.message.attachments[0]?.transcript_error).toBe("too_long");
-    expect(tooLong.calls.some((call) => call.url.endsWith("/getFile") || call.url === OPENAI_TRANSCRIPTIONS_URL)).toBe(false);
+    expect(tooLong.calls.some((call) => call.url.endsWith("/getFile") || call.url === XAI_STT_URL)).toBe(false);
 
     const tooLarge = speechApp();
     await postUpdate(tooLarge.deps, tooLarge.tasks, dmUpdate("", 8, {
@@ -198,7 +201,7 @@ describe("inbound transcripts", () => {
     }));
     const large = wakes(tooLarge.calls)[0]?.message.attachments[0];
     expect(large).toMatchObject({ kind: "audio", transcript_error: "too_large", file_url: expect.stringMatching(/\/file\/f1~/) as string });
-    expect(tooLarge.calls.some((call) => call.url === OPENAI_TRANSCRIPTIONS_URL)).toBe(false);
+    expect(tooLarge.calls.some((call) => call.url === XAI_STT_URL)).toBe(false);
 
     const unavailable = speechApp();
     await postUpdate(unavailable.deps, unavailable.tasks, dmUpdate("", 9, {
@@ -217,14 +220,14 @@ describe("inbound transcripts", () => {
       audio: { file_id: "aacFile", duration: 2, mime_type: "audio/aac", file_size: 40 },
     }));
     expect(wakes(aac.calls)[0]?.message.attachments[0]?.transcript_error).toBe("unsupported");
-    expect(openaiCalls(aac.calls)).toHaveLength(0);
+    expect(xaiCalls(aac.calls)).toHaveLength(0);
   });
 
-  it("does not send a fast greeting or an unlisted chat to OpenAI", async () => {
+  it("does not send a fast greeting or an unlisted chat to xAI", async () => {
     const greeting = speechApp({ env: speechEnv({ FAST_GREETING: "true" }) });
     await postUpdate(greeting.deps, greeting.tasks, dmUpdate("ping", 11, { voice: voice() }));
     expect(wakes(greeting.calls)).toHaveLength(0);
-    expect(openaiCalls(greeting.calls)).toHaveLength(0);
+    expect(xaiCalls(greeting.calls)).toHaveLength(0);
 
     const stranger = speechApp();
     await postUpdate(stranger.deps, stranger.tasks, {
@@ -238,7 +241,7 @@ describe("inbound transcripts", () => {
       },
     });
     expect(wakes(stranger.calls)).toHaveLength(0);
-    expect(openaiCalls(stranger.calls)).toHaveLength(0);
+    expect(xaiCalls(stranger.calls)).toHaveLength(0);
   });
 
   it("wakes a group voice note or video note only when the transcript says the username", async () => {
@@ -252,7 +255,7 @@ describe("inbound transcripts", () => {
     const quiet = speechApp({ transcript: "just chatting about lunch" });
     await postUpdate(quiet.deps, quiet.tasks, groupMedia(14, { voice: voice() }));
     expect(wakes(quiet.calls)).toHaveLength(0);
-    expect(openaiCalls(quiet.calls)).toHaveLength(1);
+    expect(xaiCalls(quiet.calls)).toHaveLength(1);
 
     const embedded = speechApp({ transcript: "see contestbot today" });
     await postUpdate(embedded.deps, embedded.tasks, groupMedia(15, { voice: voice() }));
@@ -269,7 +272,7 @@ describe("inbound transcripts", () => {
       video_note: { file_id: "noteFile", duration: 2, length: 240, file_size: 80 },
     }));
     expect(wakes(note.calls)[0]?.addressed_how).toBe("mention");
-    const uploaded = openaiCalls(note.calls)[0]?.body as FormData;
+    const uploaded = xaiCalls(note.calls)[0]?.body as FormData;
     const file = uploaded.get("file");
     expect((file as File).name).toBe("note.mp4");
     expect((file as File).type).toBe("video/mp4");
@@ -281,7 +284,7 @@ describe("inbound transcripts", () => {
       audio: { file_id: "audioFile", duration: 4, mime_type: "audio/mpeg", file_size: 80 },
     }));
     expect(wakes(ignored.calls)).toHaveLength(0);
-    expect(openaiCalls(ignored.calls)).toHaveLength(0);
+    expect(xaiCalls(ignored.calls)).toHaveLength(0);
 
     const caption = speechApp({ transcript: "the track, without a name" });
     await postUpdate(caption.deps, caption.tasks, groupMedia(19, {
@@ -296,7 +299,7 @@ describe("inbound transcripts", () => {
       transcript: "the track, without a name",
       transcript_language: "en",
     });
-    const uploaded = openaiCalls(caption.calls)[0]?.body as FormData;
+    const uploaded = xaiCalls(caption.calls)[0]?.body as FormData;
     expect((uploaded.get("file") as File).name).toBe("audio.mp3");
     expect((uploaded.get("file") as File).type).toBe("audio/mpeg");
   });
@@ -317,14 +320,14 @@ describe("inbound transcripts", () => {
     expect(payload?.message.attachments[0]?.transcript).toBe("and another thing");
   });
 
-  it("stops after the time budget so a second clip does not call OpenAI", async () => {
+  it("stops after the time budget so a second clip does not call xAI", async () => {
     let shift = 0;
     const app = speechApp({
       now: () => NOW + shift,
       handler: (call) => {
-        if (call.url !== OPENAI_TRANSCRIPTIONS_URL) return undefined;
+        if (call.url !== XAI_STT_URL) return undefined;
         shift = SPEECH_BUDGET_MS + 1;
-        return Response.json({ text: "hey testbot", languages: [{ code: "en" }] });
+        return Response.json({ text: "hey testbot", language: "en" });
       },
     });
     await postUpdate(app.deps, app.tasks, dmUpdate("", 21, {
@@ -336,7 +339,7 @@ describe("inbound transcripts", () => {
     const speech = payload.message.attachments.filter((item) => item.kind === "voice" || item.kind === "audio");
     expect(speech.map((item) => item.transcript_error).sort()).toEqual([null, "timeout"]);
     expect(speech.find((item) => item.transcript)?.transcript).toBe("hey testbot");
-    expect(openaiCalls(app.calls)).toHaveLength(1);
+    expect(xaiCalls(app.calls)).toHaveLength(1);
   });
 });
 
