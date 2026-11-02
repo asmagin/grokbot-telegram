@@ -136,14 +136,14 @@ function externalMessage(source: Record<string, unknown>, chat: TelegramChat): T
   };
 }
 
-async function toBurstItem(message: TelegramMessage, signing: Signing): Promise<WakeBurstItem> {
+async function toBurstItem(message: TelegramMessage, signing: Signing, transcripts?: ReadonlyMap<string, TranscriptFields>): Promise<WakeBurstItem> {
   return {
     message_id: message.message_id,
     text: cleanText(messageText(message), MESSAGE_TEXT_LIMIT),
     date: message.date ?? null,
     from: toPublicUser(senderUser(message)),
     media: mediaKinds(message),
-    attachments: await describeAttachments(message, signing),
+    attachments: await describeAttachments(message, { ...signing, ...(transcripts ? { transcripts } : {}) }),
     links: messageLinks(message),
     forward: parseForwardOrigin(message),
     ...structured(message),
@@ -215,7 +215,7 @@ export async function buildWakeEvent(options: {
   const attachments = await describeAttachments(message, { ...signing, ...(options.transcripts ? { transcripts: options.transcripts } : {}) });
   const burst: WakeBurstItem[] = [];
   for (const earlier of options.burstMessages ?? []) {
-    burst.push(await toBurstItem(earlier, signing));
+    burst.push(await toBurstItem(earlier, signing, options.transcripts));
   }
   return {
     schema_version: SCHEMA_VERSION,

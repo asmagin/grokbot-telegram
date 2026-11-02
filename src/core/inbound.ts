@@ -6,6 +6,7 @@ import { canonicalId } from "./config.js";
 import { secretsEqual, verifyCallbackData } from "./crypto.js";
 import { BURST_MAX_ITEMS, BURST_RECOVER_MS, burstSenderKey, clipMessage, selectBurstPrimary } from "./burst.js";
 import { hasForwardMarker } from "./content.js";
+import { listSpeechFiles } from "./media.js";
 import { safeErrorMessage } from "./log.js";
 import { runInBackground, type AppDeps } from "./deps.js";
 import { forwardToGrok } from "./grok.js";
@@ -165,6 +166,7 @@ async function handleClaimedUpdate(
       chatId,
       userId,
       scope,
+      transcripts,
       addressed: address.addressed,
       addressedHow: address.how,
       command: address.command,
@@ -257,6 +259,7 @@ async function scheduleBurst(
     chatId: string;
     userId: string | null;
     scope: string;
+    transcripts?: ReadonlyMap<string, TranscriptFields>;
     addressed: boolean;
     addressedHow: AddressHow | null;
     command: string | null;
@@ -268,7 +271,8 @@ async function scheduleBurst(
     const staged = await deps.store.stageBurst({
       scopeKey: input.scope,
       item: { updateId: input.updateId, edited: true, addressedHow: input.addressedHow,
-        command: input.command, message: clipMessage(input.message) },
+        command: input.command, message: clipMessage(input.message),
+        ...(input.transcripts ? { transcripts: [...input.transcripts] } : {}) },
       shortTerm: input.shortTerm,
       senderKey: burstSenderKey(input.message),
       now: input.now,
@@ -305,6 +309,7 @@ async function scheduleBurst(
       addressedHow: input.addressedHow,
       command: input.command,
       message: clipMessage(input.message),
+      ...(input.transcripts ? { transcripts: [...input.transcripts] } : {}),
     },
     shortTerm: input.shortTerm,
     senderKey,
@@ -385,6 +390,7 @@ async function emitBurst(deps: AppDeps, scope: string, burst: PendingBurst): Pro
     command: primary.command,
     shortTerm: burst.shortTerm,
     burstMessages: burst.items.filter((item) => item.updateId !== primary.updateId).map((item) => item.message),
+    transcripts: new Map(burst.items.flatMap((item) => item.transcripts ?? [])),
     greet: false,
   }, "inline");
 }
@@ -434,9 +440,14 @@ async function launchWake(deps: AppDeps, options: WakeLaunch, delivery: "backgro
     return json(200, { ok: true });
   }
 
-  let transcripts = options.transcripts;
-  if (deps.config.speech && !transcripts && shouldTranscribe(message, true, deps.config.telegramBotUsername)) {
-    transcripts = (await runTranscription(deps, message, options.chatId)).byFileId;
+  const transcripts = new Map(options.transcripts);
+  if (deps.config.speech) {
+    for (const source of [message, ...options.burstMessages]) {
+      if (!shouldTranscribe(source, true, deps.config.telegramBotUsername)) continue;
+      if (listSpeechFiles(source).every((file) => transcripts.has(file.fileId))) continue;
+      const speech = await runTranscription(deps, source, options.chatId);
+      for (const [fileId, fields] of speech.byFileId ?? []) transcripts.set(fileId, fields);
+    }
   }
   const wake = await buildWakeEvent({
     config: deps.config,
@@ -448,7 +459,7 @@ async function launchWake(deps: AppDeps, options: WakeLaunch, delivery: "backgro
     shortTerm: options.shortTerm,
     burstMessages: options.burstMessages,
     nowMs: options.now,
-    ...(transcripts ? { transcripts } : {}),
+    ...(transcripts.size > 0 ? { transcripts } : {}),
   });
   if (!wake) {
     deps.log({
@@ -823,6 +834,25 @@ async function runTranscription(
   chatId: string,
 ): Promise<{ byFileId?: ReadonlyMap<string, TranscriptFields>; mentioned: boolean }> {
   if (!deps.config.speech) return { mentioned: false };
+  // Separate from wake limits: non-mentions also consume provider resources,
+  // while a permitted spoken mention must still be able to create its wake.
+  const now = deps.now();
+  const sender = senderUser(message);
+  const chatRate = await deps.store.hitRate(`${rateChatKey(chatId)}:speech`, now,
+    deps.config.rateLimitWindowMs, deps.config.rateLimitMax);
+  const userRate = sender
+    ? await deps.store.hitRate(`${rateUserKey(chatId, String(sender.id))}:speech`, now,
+      deps.config.rateLimitWindowMs, deps.config.rateLimitMax)
+    : { allowed: true };
+  if (!chatRate.allowed || !userRate.allowed) {
+    deps.log({ event: "transcribe_skipped", reason: "rate_limited", chat_id: chatId });
+    return {
+      mentioned: false,
+      byFileId: new Map(listSpeechFiles(message).map((file) => [file.fileId, {
+        transcript: null, transcript_language: null, transcript_error: "unavailable" as const,
+      }])),
+    };
+  }
   try {
     return await transcribeMessage({
       message,

@@ -1,4 +1,4 @@
-import type { AddressHow, ContextMessage, TelegramMessage, TypingScope } from "./types.js";
+import type { AddressHow, ContextMessage, TelegramMessage, TranscriptFields, TypingScope } from "./types.js";
 import { scopeDeadline } from "./typing.js";
 
 /** One Telegram update held while a forward burst is still open. */
@@ -8,6 +8,8 @@ export interface BurstItem {
   addressedHow: AddressHow | null;
   command: string | null;
   message: TelegramMessage;
+  /** Speech already processed while checking whether this update addressed the bot. */
+  transcripts?: Array<[string, TranscriptFields]>;
 }
 
 /** Per chat and forum topic. The flush that still matches `generation` delivers it. */
@@ -191,8 +193,8 @@ export function chatIdFromRateKey(key: string): string {
   const prefix = "rate:chat:";
   if (!key.startsWith(prefix)) return "";
   const rest = key.slice(prefix.length);
-  const userIdx = rest.indexOf(":user:");
-  return userIdx === -1 ? rest : rest.slice(0, userIdx);
+  const suffixIdx = rest.indexOf(":");
+  return suffixIdx === -1 ? rest : rest.slice(0, suffixIdx);
 }
 
 /**

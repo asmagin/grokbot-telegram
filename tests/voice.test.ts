@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildDeps } from "../src/core/deps.js";
+import { chatIdFromRateKey } from "../src/core/store.js";
 import { handleRequest } from "../src/core/handler.js";
 import { XAI_TRANSCRIBE_MODEL, XAI_STT_URL, SPEECH_BUDGET_MS } from "../src/core/transcribe.js";
 import { TELEGRAM_GET_FILE_MAX_BYTES, type WakeEvent } from "../src/core/types.js";
@@ -9,6 +10,8 @@ import {
   dmUpdate,
   NOW,
   postUpdate,
+  settle,
+  webhookRequest,
   testEnv,
   type RecordedCall,
 } from "./helpers.js";
@@ -27,6 +30,7 @@ function speechApp(options: {
   handler?: (call: RecordedCall) => Response | Promise<Response> | undefined;
   log?: (event: Record<string, unknown>) => void;
   now?: () => number;
+  delay?: (ms: number) => Promise<void>;
 } = {}) {
   const mock = createFetchMock(async (call) => {
     const custom = await options.handler?.(call);
@@ -58,6 +62,7 @@ function speechApp(options: {
     sleep: async () => undefined,
     waitUntil: (promise) => tasks.push(promise),
     typingMode: "once",
+    ...(options.delay ? { delay: options.delay } : {}),
     log: options.log ?? (() => undefined),
   });
   return { deps, tasks, calls: mock.calls };
@@ -91,6 +96,74 @@ function groupMedia(updateId: number, extra: Record<string, unknown>) {
 }
 
 describe("inbound transcripts", () => {
+  it.each(["hey testbot", "just chatting"])("caps group transcription before downloads for %s", async (transcript) => {
+    let now = NOW;
+    const app = speechApp({ transcript, now: () => now, env: speechEnv({ RATE_LIMIT_MAX: "1" }) });
+    for (let id = 101; id <= 103; id++) {
+      await postUpdate(app.deps, app.tasks, groupMedia(id, { voice: voice({ file_id: `file${id}` }) }));
+    }
+    expect(xaiCalls(app.calls)).toHaveLength(1);
+    expect(app.calls.filter((call) => call.url.endsWith("/getFile"))).toHaveLength(1);
+    expect(wakes(app.calls)).toHaveLength(transcript.includes("testbot") ? 1 : 0);
+    now += app.deps.config.rateLimitWindowMs + 1;
+    await postUpdate(app.deps, app.tasks, groupMedia(104, { voice: voice({ file_id: "afterWindow" }) }));
+    expect(xaiCalls(app.calls)).toHaveLength(2);
+  });
+
+  it("shares the transcription cap across group members", async () => {
+    const app = speechApp({ transcript: "no mention", env: speechEnv({ RATE_LIMIT_MAX: "1" }) });
+    await Promise.all([42, 43, 44].map((id) => postUpdate(app.deps, app.tasks,
+      groupMedia(id, { from: { id, first_name: "Member" }, voice: voice({ file_id: `file${id}` }) }))));
+    expect(xaiCalls(app.calls)).toHaveLength(1);
+    expect(app.calls.filter((call) => call.url.endsWith("/getFile"))).toHaveLength(1);
+  });
+
+  it("retains a spoken-mention transcript across burst buffering without a second request", async () => {
+    const pending: Array<() => void> = [];
+    const app = speechApp({
+      env: speechEnv({ FORWARD_BURST_MS: "1500", RATE_LIMIT_MAX: "1" }),
+      delay: () => new Promise<void>((resolve) => pending.push(resolve)),
+    });
+    await handleRequest(webhookRequest(groupMedia(301, {
+      voice: voice(),
+      forward_origin: { type: "hidden_user", date: 1700000000, sender_user_name: "Speaker" },
+    })), app.deps);
+    for (const release of pending) release();
+    await settle(app.tasks);
+    expect(xaiCalls(app.calls)).toHaveLength(1);
+    expect(wakes(app.calls)[0]?.message.attachments[0]?.transcript).toBe("hey testbot");
+  });
+
+  it("routes transcription rate buckets to the same chat Durable Object", () => {
+    expect(chatIdFromRateKey("rate:chat:-500:speech")).toBe("-500");
+    expect(chatIdFromRateKey("rate:chat:-500:user:42:speech")).toBe("-500");
+  });
+
+  it.each(["voice", "audio", "video_note"])("transcribes forwarded %s merged with a text comment", async (kind) => {
+    const pending: Array<() => void> = [];
+    const app = speechApp({
+      env: speechEnv({ FORWARD_BURST_MS: "1500" }),
+      delay: () => new Promise<void>((resolve) => pending.push(resolve)),
+    });
+    await handleRequest(webhookRequest(dmUpdate("", 201, {
+      text: undefined,
+      [kind]: voice({ file_id: "forwardedSpeech" }),
+      forward_origin: { type: "hidden_user", date: 1700000000, sender_user_name: "Speaker" },
+    })), app.deps);
+    await handleRequest(webhookRequest(dmUpdate("summarize this", 202)), app.deps);
+    for (const release of pending) release();
+    await settle(app.tasks);
+    const delivered = wakes(app.calls);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]?.message.text).toBe("summarize this");
+    expect(delivered[0]?.message.attachments).toHaveLength(0);
+    expect(delivered[0]?.message.burst[0]?.attachments[0]).toMatchObject({
+      kind, transcript: "hey testbot", transcript_language: "en", transcript_error: null,
+      file_url: expect.stringContaining("/file/f1~") as string,
+    });
+    expect(xaiCalls(app.calls)).toHaveLength(1);
+  });
+
   it("leaves a voice note unchanged when the xAI key is unset", async () => {
     const app = speechApp({ env: testEnv({ TRANSCRIBE_MAX_SECONDS: "30" }) });
     await postUpdate(app.deps, app.tasks, dmUpdate("", 1, { text: undefined, voice: voice() }));
