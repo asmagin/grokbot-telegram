@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { MAX_BUTTON_DATA_BYTES, normalizeButtonUrl, parseButtons } from "../src/core/buttons.js";
 import { signCallbackData, signReplyToken, verifyCallbackData, verifyReplyToken } from "../src/core/crypto.js";
 import { handleRequest } from "../src/core/handler.js";
-import type { InlineKeyboardMarkup, WakeEvent } from "../src/core/types.js";
+import { TELEGRAM_TEXT_LIMIT, type InlineKeyboardMarkup, type WakeEvent } from "../src/core/types.js";
 import { createTestApp, dmUpdate, groupUpdate, NOW, postUpdate, testEnv, webhookRequest } from "./helpers.js";
 
 const SECRET = "reply-token-secret-for-tests-only-0123456789";
@@ -274,6 +274,43 @@ describe("callback queries", () => {
       callback_query_id: "cq-51",
       text: "Already chosen.",
     });
+  });
+
+  it("keeps all 4096 characters of the bot message on the tap", async () => {
+    const tail = "ONLY-THIS-ACTION";
+    const text = `${"a".repeat(TELEGRAM_TEXT_LIMIT - tail.length)}${tail}`;
+    expect(text).toHaveLength(TELEGRAM_TEXT_LIMIT);
+    const app = createTestApp();
+    const wake = await repliedToken(app);
+    const sent = await handleRequest(new Request("https://bridge.example/send", {
+      method: "POST",
+      headers: { authorization: `Bearer ${wake.reply.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: "42",
+        text,
+        final: true,
+        buttons: [[{ text: "Approve", data: "approve" }]],
+      }),
+    }), app.deps);
+    expect(sent.status).toBe(200);
+    const messageId = ((await sent.json()) as { message_ids: number[] }).message_ids[0] ?? 0;
+    const callbackData = ((callsEnding(app.calls, "sendMessage").at(-1)?.body as { text?: string; reply_markup: InlineKeyboardMarkup })
+      .reply_markup.inline_keyboard[0]?.[0]?.callback_data) ?? "";
+    const before = wakes(app.calls).length;
+    await postUpdate(app.deps, app.tasks, callbackUpdate({
+      updateId: 55,
+      data: callbackData,
+      messageId,
+      text,
+      buttonText: "Approve",
+    }));
+    const event = wakes(app.calls).at(-1);
+    expect(wakes(app.calls)).toHaveLength(before + 1);
+    expect(event?.callback?.message_text).toBe(text);
+    expect(event?.callback?.message_text?.endsWith(tail)).toBe(true);
+    expect(event?.message.text).toBe("Approve");
+    expect(event?.short_term).toEqual([]);
+    expect(event?.message.reply_to).toBeNull();
   });
 
   it("toasts a different person, drops a forged or cross-chat tap, and still enforces the allowlist", async () => {

@@ -4,7 +4,7 @@ import { messageText, senderUser, topicThreadId } from "./address.js";
 import { describeAttachments } from "./media.js";
 import { cleanLabel, cleanText, joinUrl, mediaKinds } from "./text.js";
 import type { ContextMessage, PublicUser, ReplyClaims, TelegramChat, TelegramMessage, TelegramUser, WakeEvent, WakeReply } from "./types.js";
-import { SCHEMA_VERSION } from "./types.js";
+import { SCHEMA_VERSION, TELEGRAM_TEXT_LIMIT } from "./types.js";
 
 export const MESSAGE_TEXT_LIMIT = 4000;
 export const CONTEXT_TEXT_LIMIT = 1000;
@@ -169,7 +169,9 @@ export async function buildCallbackWakeEvent(options: {
       data: options.data,
       text: label,
       message_id: options.messageId,
-      message_text: cleanText(options.messageText, MESSAGE_TEXT_LIMIT),
+      // The whole bubble the button was on. User wakes cap text at 4000; this one
+      // does not, because a tap has no other copy of the message and Telegram allows 4096.
+      message_text: cleanText(options.messageText, TELEGRAM_TEXT_LIMIT),
     },
     short_term: [],
     reply: signed.reply,

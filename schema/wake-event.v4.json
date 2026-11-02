@@ -83,7 +83,7 @@
         "data": { "type": "string", "maxLength": 27, "description": "The data the bot set on the button. At most 27 bytes, which is what fits in a signed callback_data." },
         "text": { "type": "string", "maxLength": 64, "description": "The button label." },
         "message_id": { "type": "integer", "description": "The bot message that carried the keyboard." },
-        "message_text": { "type": "string", "maxLength": 4000, "description": "Text or caption of that bot message. This is the action a private-chat Approve tap confirms, and nothing beyond it." }
+        "message_text": { "type": "string", "maxLength": 4096, "description": "Full text or caption of that bot message, up to Telegram's 4096-character limit. This is the action a private-chat Approve tap confirms, and nothing beyond it. Unlike message.text on an ordinary wake, it is not cut at 4000." }
       }
     },
     "short_term": {
