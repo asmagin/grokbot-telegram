@@ -4,6 +4,7 @@ import { scopeDeadline } from "./typing.js";
 /** One Telegram update held while a forward burst is still open. */
 export interface BurstItem {
   updateId: number;
+  edited?: boolean;
   addressedHow: AddressHow | null;
   command: string | null;
   message: TelegramMessage;
@@ -95,7 +96,8 @@ export interface Store {
   /** The open forward burst in this chat and topic, or null. */
   peekBurst(scopeKey: string): Promise<BurstPeek | null>;
   /**
-   * Open a burst or append to the one from the same sender.
+   * Open a burst or append to the one from the same sender. Edits replace an
+   * existing message only, keeping its position and the surrounding context.
    * Read-modify-write stays inside this call so two updates cannot lose an item.
    */
   stageBurst(input: {
@@ -231,6 +233,7 @@ export class MemoryStore implements Store {
   private readonly outbound = new Map<string, { until: number; ids: number[]; tail: EditTail | null }>();
   private readonly editLocks = new Map<string, { until: number; token: string }>();
   private readonly bursts = new Map<string, PendingBurst>();
+  private burstGeneration = 0;
 
   async claimUpdate(updateId: number, now: number, ttlMs: number): Promise<"new" | "duplicate"> {
     this.pruneUpdates(now);
@@ -419,7 +422,11 @@ export class MemoryStore implements Store {
     create: boolean;
   }): Promise<BurstStage> {
     const existing = this.bursts.get(input.scopeKey);
-    if (existing && existing.flushAt <= input.now) {
+    const editIndex = input.item.edited
+      ? existing?.items.findIndex((item) => item.message.message_id === input.item.message.message_id) ?? -1
+      : -1;
+    if (input.item.edited && editIndex < 0) return { joined: false, generation: 0, delayMs: 0 };
+    if (!input.item.edited && existing && existing.flushAt <= input.now) {
       return { joined: false, generation: 0, delayMs: 0, overdueGeneration: existing.generation };
     }
     if (existing && existing.senderKey !== input.senderKey) {
@@ -428,18 +435,19 @@ export class MemoryStore implements Store {
     if (!existing) {
       if (!input.create) return { joined: false, generation: 0, delayMs: 0 };
       const created: PendingBurst = {
-        generation: 1,
+        generation: ++this.burstGeneration,
         senderKey: input.senderKey,
         flushAt: input.now + input.debounceMs,
         shortTerm: input.shortTerm,
         items: [input.item],
       };
       this.rememberBurst(input.scopeKey, created, input.now);
-      return { joined: true, generation: 1, delayMs: input.debounceMs };
+      return { joined: true, generation: created.generation, delayMs: input.debounceMs };
     }
-    existing.generation += 1;
+    existing.generation = ++this.burstGeneration;
     existing.flushAt = input.now + input.debounceMs;
-    existing.items.push(input.item);
+    if (editIndex >= 0) existing.items[editIndex] = input.item;
+    else existing.items.push(input.item);
     while (existing.items.length > input.maxItems) existing.items.shift();
     this.rememberBurst(input.scopeKey, existing, input.now);
     return { joined: true, generation: existing.generation, delayMs: input.debounceMs };

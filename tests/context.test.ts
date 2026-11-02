@@ -304,6 +304,52 @@ describe("contacts, locations, venues, and polls", () => {
 });
 
 describe("forward and comment burst", () => {
+  it("keeps forwarded attachments when a buffered comment is edited", async () => {
+    const gate = gateDelay();
+    const app = createTestApp({ env: testEnv({ FORWARD_BURST_MS: "1500" }), delay: gate.delay });
+    await handleRequest(webhookRequest(dmUpdate("", 1, {
+      text: undefined,
+      photo: [{ file_id: "EDITPHOTOFILE", width: 4, height: 4, file_size: 10 }],
+      forward_origin: userOrigin(),
+    })), app.deps);
+    const comment = dmUpdate("describe this", 2);
+    await handleRequest(webhookRequest(comment), app.deps);
+    await handleRequest(webhookRequest({
+      update_id: 3,
+      edited_message: { ...comment.message, text: "describe this photo" },
+    }), app.deps);
+    gate.release();
+    await settle(app.tasks);
+    const delivered = wakes(app.calls);
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toMatchObject({ update_id: 3, edited: true });
+    expect(delivered[0]?.message.text).toBe("describe this photo");
+    expect(delivered[0]?.message.burst).toHaveLength(1);
+    expect(delivered[0]?.message.burst[0]?.attachments).toHaveLength(1);
+    expect(delivered[0]?.message.burst[0]?.forward?.username).toBe("grace");
+  });
+
+  it("does not let a delayed old timer flush a replacement burst", async () => {
+    const gate = gateDelay();
+    const app = createTestApp({ env: testEnv({ FORWARD_BURST_MS: "1500" }), delay: gate.delay });
+    let now = app.deps.now();
+    app.deps.now = () => now;
+    await handleRequest(webhookRequest(dmUpdate("first", 1, { forward_origin: userOrigin() })), app.deps);
+    const oldTimer = gate.pending.shift()!;
+    now += 1600;
+    await handleRequest(webhookRequest(dmUpdate("second", 2, { forward_origin: userOrigin() })), app.deps);
+    oldTimer();
+    await vi.waitUntil(() => wakes(app.calls).length === 1);
+    expect(await app.deps.store.peekBurst(scopeKey("42", null))).not.toBeNull();
+    await handleRequest(webhookRequest(dmUpdate("handle second", 3)), app.deps);
+    gate.release();
+    await settle(app.tasks);
+    const delivered = wakes(app.calls);
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]?.message.text).toBe("handle second");
+    expect(delivered[1]?.message.burst.map((item) => item.text)).toEqual(["second"]);
+  });
+
   it("merges a forward and the following comment into one wake", async () => {
     const gate = gateDelay();
     const app = createTestApp({

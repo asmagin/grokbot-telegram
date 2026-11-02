@@ -17,6 +17,25 @@ function ctx(id: number, date: number): ContextMessage {
 }
 
 describe("durable object dedupe storage", () => {
+  it("preserves legacy burst generations when recovering after an upgrade", async () => {
+    const storage = memoryStorage();
+    const scopeKey = "chat:1:thread:root";
+    const item = {
+      updateId: 1, addressedHow: "private", command: null,
+      message: { message_id: 1, text: "forward", chat: { id: 1, type: "private" } },
+    };
+    await storage.put(`burst:${scopeKey}`, {
+      generation: 7, senderKey: "user:1", flushAt: 1000, shortTerm: [], items: [item],
+    });
+    await op(storage, { op: "burst.take", scopeKey, generation: 7 });
+    const next = await op(storage, {
+      op: "burst.stage", scopeKey, item, senderKey: "user:1", shortTerm: [],
+      now: 2000, debounceMs: 1500, maxItems: 8, create: true,
+    });
+    expect(next.generation).toBe(8);
+    expect(await op(storage, { op: "burst.take", scopeKey, generation: 7 })).toEqual({ burst: null });
+  });
+
   it("keeps one key per update and prunes expired ones instead of one growing map", async () => {
     const storage = memoryStorage();
     for (let id = 1; id <= 5; id += 1) {
@@ -155,10 +174,21 @@ describe("durable object dedupe storage", () => {
       op: "burst.stage", scopeKey, item: item(4, "old"), shortTerm: [], senderKey: "user:1",
       now: 1000, debounceMs: 500, maxItems: 8, create: true,
     });
+    expect(stale.generation).not.toBe(opened.generation);
+    expect(await op(storage, { op: "burst.take", scopeKey, generation: opened.generation })).toEqual({ burst: null });
+    const edited = await op(storage, {
+      op: "burst.stage", scopeKey, item: { ...item(4, "edited"), updateId: 6, edited: true },
+      shortTerm: [], senderKey: "user:1", now: 1100, debounceMs: 500, maxItems: 8, create: false,
+    });
+    expect(edited.joined).toBe(true);
+    expect(await op(storage, { op: "burst.take", scopeKey, generation: stale.generation })).toEqual({ burst: null });
     expect(await op(storage, {
       op: "burst.stage", scopeKey, item: item(5, "late"), shortTerm: [], senderKey: "user:1",
       now: 2000, debounceMs: 500, maxItems: 8, create: true,
-    })).toMatchObject({ joined: false, overdueGeneration: stale.generation });
+    })).toMatchObject({ joined: false, overdueGeneration: edited.generation });
+    const final = await op(storage, { op: "burst.take", scopeKey, generation: edited.generation });
+    expect(final.burst).toMatchObject({ items: [{ updateId: 6, edited: true, message: { text: "edited" } }] });
+    expect((final.burst as { items: unknown[] }).items).toHaveLength(1);
   });
 
   it("does not attach context older than a week", async () => {

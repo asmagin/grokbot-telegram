@@ -138,10 +138,10 @@ async function handleClaimedUpdate(
   }
 
   const address = classifyAddress(message, deps.config);
-  // Edits skip the burst: an edit is not the forward-then-comment pair.
-  if (!edited && deps.config.forwardBurstMs > 0) {
+  if (deps.config.forwardBurstMs > 0) {
     const plan = await scheduleBurst(deps, {
       updateId: update.update_id,
+      edited,
       message,
       now,
       chatId,
@@ -230,6 +230,7 @@ async function scheduleBurst(
   deps: AppDeps,
   input: {
     updateId: number;
+    edited: boolean;
     message: TelegramMessage;
     now: number;
     chatId: string;
@@ -241,6 +242,23 @@ async function scheduleBurst(
     shortTerm: ContextMessage[];
   },
 ): Promise<"scheduled" | "dropped" | "passthrough" | "rated"> {
+  // Replace only an already buffered item, atomically with respect to its waiter.
+  if (input.edited) {
+    const staged = await deps.store.stageBurst({
+      scopeKey: input.scope,
+      item: { updateId: input.updateId, edited: true, addressedHow: input.addressedHow,
+        command: input.command, message: clipMessage(input.message) },
+      shortTerm: input.shortTerm,
+      senderKey: burstSenderKey(input.message),
+      now: input.now,
+      debounceMs: deps.config.forwardBurstMs,
+      maxItems: BURST_MAX_ITEMS,
+      create: false,
+    });
+    if (!staged.joined) return "passthrough";
+    armBurst(deps, input.scope, staged.generation, staged.delayMs);
+    return "scheduled";
+  }
   await recoverOverdue(deps, input.scope, input.now);
   const forward = hasForwardMarker(input.message);
   const senderKey = burstSenderKey(input.message);
@@ -336,7 +354,7 @@ async function emitBurst(deps: AppDeps, scope: string, burst: PendingBurst): Pro
   await launchWake(deps, {
     updateId: primary.updateId,
     message,
-    edited: false,
+    edited: primary.edited ?? false,
     now: deps.now(),
     chatId,
     userId: sender ? String(sender.id) : null,

@@ -421,27 +421,35 @@ async function burstStage(storage: DoStorage, body: DoOp): Promise<BurstStage> {
     return { joined: false, generation: 0, delayMs: 0 };
   }
   const existing = await readBurst(storage, scopeKey);
-  if (existing && existing.flushAt <= now) {
+  const editIndex = item.edited
+    ? existing?.items.findIndex((entry) => entry.message.message_id === item.message.message_id) ?? -1
+    : -1;
+  if (item.edited && editIndex < 0) return { joined: false, generation: 0, delayMs: 0 };
+  if (!item.edited && existing && existing.flushAt <= now) {
     return { joined: false, generation: 0, delayMs: 0, overdueGeneration: existing.generation };
   }
   if (existing && existing.senderKey !== body.senderKey) {
     return { joined: false, generation: 0, delayMs: 0 };
   }
+  if (!existing && body.create !== true) return { joined: false, generation: 0, delayMs: 0 };
+  // Persist across removals and object restarts; old waiters must never match a new burst.
+  const generation = Math.max(await storage.get<number>("burst-generation") ?? 0, existing?.generation ?? 0) + 1;
+  await storage.put("burst-generation", generation);
   if (!existing) {
-    if (body.create !== true) return { joined: false, generation: 0, delayMs: 0 };
     const created: PendingBurst = {
-      generation: 1,
+      generation,
       senderKey: body.senderKey,
       flushAt: now + debounceMs,
       shortTerm: Array.isArray(body.shortTerm) ? body.shortTerm : [],
       items: [item],
     };
     await storage.put(burstKey(scopeKey), created);
-    return { joined: true, generation: 1, delayMs: debounceMs };
+    return { joined: true, generation, delayMs: debounceMs };
   }
-  existing.generation += 1;
+  existing.generation = generation;
   existing.flushAt = now + debounceMs;
-  existing.items.push(item);
+  if (editIndex >= 0) existing.items[editIndex] = item;
+  else existing.items.push(item);
   while (existing.items.length > maxItems) existing.items.shift();
   await storage.put(burstKey(scopeKey), existing);
   return { joined: true, generation: existing.generation, delayMs: debounceMs };
@@ -451,6 +459,10 @@ async function burstTake(storage: DoStorage, body: DoOp): Promise<{ burst: Pendi
   if (!body.scopeKey || typeof body.generation !== "number") return { burst: null };
   const existing = await readBurst(storage, body.scopeKey);
   if (!existing || existing.generation !== body.generation) return { burst: null };
+  // Older deployments stored only the active generation. Seed the counter before
+  // removing such a burst so its still-running waiter cannot match its successor.
+  const generation = await storage.get<number>("burst-generation") ?? 0;
+  if (generation < existing.generation) await storage.put("burst-generation", existing.generation);
   await storage.delete(burstKey(body.scopeKey));
   return { burst: existing };
 }
