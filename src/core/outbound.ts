@@ -1,4 +1,5 @@
 import { isOutboundChatAllowed } from "./allowlist.js";
+import { keyboardForSend, parseButtons, type ButtonSpec } from "./buttons.js";
 import { canonicalId } from "./config.js";
 import { replyTokenScopeOk, secretsEqual, verifyReplyToken } from "./crypto.js";
 import type { AppDeps } from "./deps.js";
@@ -7,7 +8,7 @@ import { cleanFileName, normalizePublicMediaUrl } from "./media.js";
 import { scopeKey, type SendRecord } from "./store.js";
 import type { SendMessageResult } from "./telegram.js";
 import { splitTelegramText } from "./text.js";
-import { TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT, type ReplyClaims, type SendMediaKind } from "./types.js";
+import { TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT, type InlineKeyboardMarkup, type ReplyClaims, type SendMediaKind } from "./types.js";
 
 const MAX_TEXT_CHARS = TELEGRAM_TEXT_LIMIT * 8;
 
@@ -20,6 +21,7 @@ interface SendBody {
   wake_id?: unknown;
   disable_notification?: unknown;
   idempotency_key?: unknown;
+  buttons?: unknown;
 }
 
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -47,9 +49,13 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
   if (!text.trim()) return json(400, { ok: false, error: "empty_text" });
   if (text.length > MAX_TEXT_CHARS) return json(413, { ok: false, error: "text_too_large" });
   if (threadId === "invalid" || replyTo === "invalid") return json(400, { ok: false, error: "bad_message_id" });
+  const parsedButtons = parseButtons(body.buttons);
+  if (!parsedButtons.ok) return json(400, { ok: false, error: parsedButtons.error });
 
   const auth = await authorize(credential, deps, chatId, threadId, { allowClosed: true });
   if (!auth.ok) return auth.response;
+  const keyboard = await keyboardFrom(deps, chatId, auth, parsedButtons.rows);
+  if (!keyboard.ok) return keyboard.response;
   const reserved = await reserveSend(deps, auth, chatId, final, idempotencyKey);
   if (!reserved.ok) return reserved.response;
 
@@ -69,9 +75,12 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
       message_thread_id?: number;
       reply_to_message_id?: number;
       disable_notification?: boolean;
+      reply_markup?: InlineKeyboardMarkup;
     } = { chat_id: chatId, text: part, disable_notification: silent };
     if (typeof threadId === "number") input.message_thread_id = threadId;
     if (index === 0 && typeof replyTo === "number") input.reply_to_message_id = replyTo;
+    // A split reply is several bubbles. The keyboard belongs on the last one.
+    if (keyboard.markup && index === parts.length - 1) input.reply_markup = keyboard.markup;
     const sent = await deps.telegram.sendMessage(input);
     if (!sent.ok) return failSend(deps, { chatId, auth, scope, reserved, messageIds, sent });
     messageIds.push(sent.messageId);
@@ -114,6 +123,8 @@ export async function handleSendMedia(request: Request, deps: AppDeps): Promise<
 
   const auth = await authorize(credential, deps, media.chatId, media.threadId, { allowClosed: true });
   if (!auth.ok) return auth.response;
+  const keyboard = await keyboardFrom(deps, media.chatId, auth, media.buttons);
+  if (!keyboard.ok) return keyboard.response;
   const reserved = await reserveSend(deps, auth, media.chatId, media.final, media.idempotencyKey);
   if (!reserved.ok) return reserved.response;
 
@@ -130,11 +141,13 @@ export async function handleSendMedia(request: Request, deps: AppDeps): Promise<
     message_thread_id?: number;
     reply_to_message_id?: number;
     disable_notification?: boolean;
+    reply_markup?: InlineKeyboardMarkup;
   } = {
     chat_id: media.chatId,
     kind: media.kind,
     disable_notification: silent,
   };
+  if (keyboard.markup) input.reply_markup = keyboard.markup;
   if (media.caption) input.caption = media.caption;
   if (media.threadId !== null) input.message_thread_id = media.threadId;
   if (media.replyTo !== null) input.reply_to_message_id = media.replyTo;
@@ -393,16 +406,23 @@ export async function authenticate(
   return { ok: false, response: json(401, { ok: false, error: "unauthorized" }) };
 }
 
+interface AuthorizedSend {
+  wakeId: string | null;
+  expiresAtMs: number;
+  closed: boolean;
+  /** Person the wake was for. Null on an operator send, and on tokens minted before buttons. */
+  userId: string | null;
+  /** True when this send is a reply to a wake, so callback buttons belong to userId. */
+  bindToUser: boolean;
+}
+
 async function authorize(
   credential: Credential,
   deps: AppDeps,
   chatId: string,
   threadId: number | null,
   options: { allowClosed?: boolean } = {},
-): Promise<
-  | { ok: true; wakeId: string | null; expiresAtMs: number; closed: boolean }
-  | { ok: false; response: Response }
-> {
+): Promise<{ ok: true } & AuthorizedSend | { ok: false; response: Response }> {
   if (credential.kind === "token") {
     const claims = credential.claims;
     if (!replyTokenScopeOk(claims, chatId, threadId)) {
@@ -413,13 +433,38 @@ async function authorize(
     if (closed && !options.allowClosed) {
       return { ok: false, response: json(401, { ok: false, error: "wake_closed" }) };
     }
-    return { ok: true, wakeId: claims.wake_id, expiresAtMs: claims.exp * 1000, closed };
+    return {
+      ok: true,
+      wakeId: claims.wake_id,
+      expiresAtMs: claims.exp * 1000,
+      closed,
+      userId: claims.user_id ?? null,
+      bindToUser: true,
+    };
   }
 
   if (!isOutboundChatAllowed(chatId, deps.config)) {
     return { ok: false, response: json(403, { ok: false, error: "not_allowlisted" }) };
   }
-  return { ok: true, wakeId: null, expiresAtMs: deps.now() + 60_000, closed: false };
+  return { ok: true, wakeId: null, expiresAtMs: deps.now() + 60_000, closed: false, userId: null, bindToUser: false };
+}
+
+async function keyboardFrom(
+  deps: AppDeps,
+  chatId: string,
+  auth: AuthorizedSend,
+  rows: ButtonSpec[][] | null,
+): Promise<{ ok: true; markup: InlineKeyboardMarkup | null } | { ok: false; response: Response }> {
+  const keyboard = await keyboardForSend({
+    secret: deps.config.replyTokenSecret,
+    chatId,
+    ownerUserId: auth.userId,
+    bindToUser: auth.bindToUser,
+    rows,
+    exp: Math.floor(deps.now() / 1000) + deps.config.replyTokenTtlSeconds,
+  });
+  if (!keyboard.ok) return { ok: false, response: json(400, { ok: false, error: keyboard.error }) };
+  return { ok: true, markup: keyboard.markup };
 }
 
 async function readJson(
@@ -458,6 +503,7 @@ interface MediaCommand {
   disableNotification: boolean | undefined;
   kind: SendMediaKind;
   caption: string;
+  buttons: ButtonSpec[][] | null;
   source: { type: "url"; url: string } | { type: "file"; file: { bytes: Uint8Array; filename: string; mime: string } };
 }
 
@@ -483,6 +529,8 @@ function sharedMediaFields(body: MediaBody): { ok: true; fields: Omit<MediaComma
   if (caption.length > TELEGRAM_CAPTION_LIMIT) {
     return { ok: false, response: json(413, { ok: false, error: "caption_too_large" }) };
   }
+  const parsedButtons = parseButtons(body.buttons);
+  if (!parsedButtons.ok) return { ok: false, response: json(400, { ok: false, error: parsedButtons.error }) };
   const final = body.final === true;
   return {
     ok: true,
@@ -496,6 +544,7 @@ function sharedMediaFields(body: MediaBody): { ok: true; fields: Omit<MediaComma
       disableNotification: typeof body.disable_notification === "boolean" ? body.disable_notification : undefined,
       kind,
       caption,
+      buttons: parsedButtons.rows,
     },
   };
 }
@@ -557,6 +606,14 @@ async function readMediaUpload(
     final: finalRaw === "true",
     ...(notifyRaw === "true" || notifyRaw === "false" ? { disable_notification: notifyRaw === "true" } : {}),
   };
+  const buttonsField = text("buttons");
+  if (buttonsField !== null && buttonsField !== "") {
+    try {
+      body.buttons = JSON.parse(buttonsField) as unknown;
+    } catch {
+      return { ok: false, response: json(400, { ok: false, error: "bad_buttons" }) };
+    }
+  }
   const shared = sharedMediaFields(body);
   if (!shared.ok) return shared;
   const uploaded = form.get("file");

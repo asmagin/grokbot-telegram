@@ -65,6 +65,8 @@ export async function handleDoFetch(
       return Response.json(await release(storage, body));
     case "msg.claim":
       return Response.json(await claimMessage(storage, body));
+    case "cb.claim":
+      return Response.json(await claimCallback(storage, body));
     case "rate":
       return Response.json(await rate(storage, body));
     case "context":
@@ -208,6 +210,19 @@ async function claimMessage(storage: DoStorage, body: DoOp): Promise<{ status: "
   if (expiry !== undefined && expiry > now) return { status: "duplicate" };
   await storage.put(key, now + body.ttlMs);
   await pruneExpired(storage, "msg:", now);
+  return { status: "new" };
+}
+
+/** One accepted tap per bot message. Lives on the chat object, next to message claims. */
+async function claimCallback(storage: DoStorage, body: DoOp): Promise<{ status: "new" | "duplicate" }> {
+  const messageId = body.messageId;
+  const now = body.now ?? Date.now();
+  if (typeof messageId !== "number" || typeof body.ttlMs !== "number") return { status: "duplicate" };
+  const key = `cb:${String(messageId).padStart(16, "0")}`;
+  const expiry = await storage.get<number>(key);
+  if (expiry !== undefined && expiry > now) return { status: "duplicate" };
+  await storage.put(key, now + body.ttlMs);
+  await pruneExpired(storage, "cb:", now);
   return { status: "new" };
 }
 

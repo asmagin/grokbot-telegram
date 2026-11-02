@@ -163,7 +163,7 @@ Message the bot in a direct chat, then try a group.
 
 ## How the assistant replies
 
-Each accepted update reaches the routine as JSON with `schema_version: 3` ([`schema/wake-event.v3.json`](schema/wake-event.v3.json)). Version 3 adds `message.attachments` and `reply.send_media_url`. Every version 2 field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, and a signed token scoped to that chat and forum topic.
+Each accepted update reaches the routine as JSON with `schema_version: 4` ([`schema/wake-event.v4.json`](schema/wake-event.v4.json)). Version 4 adds `callback` and `addressed_how: "callback"` for an inline button tap. `callback` is null on an ordinary message. Version 3 added `message.attachments` and `reply.send_media_url`. Every earlier field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, and a signed token scoped to that chat and forum topic. New tokens also carry the sender's user id, so a button can be bound to that person.
 
 ```bash
 curl -sS -X POST "$SEND_URL" \
@@ -200,6 +200,23 @@ curl -sS -X POST "$SEND_MEDIA_URL" \
 ```
 
 The token lasts `REPLY_TOKEN_TTL_SECONDS` (30 minutes by default). It works for several sends until the final one, so the assistant can send a progress line and then the answer. It is valid only for its chat and topic. Use a different `REPLY_TOKEN_SECRET` for every bridge, because every bridge that shares a secret accepts the same tokens.
+
+### Inline buttons
+
+`/send` and `/send/media` take an optional `buttons` array of rows. Each button is `{ "text", "data" }` or `{ "text", "url" }`. `text` is the label, 1 to 64 characters. `data` is the action code, 1 to 27 bytes, with no control characters. `url` is `https`, with a hostname, and no username or password. A button has `data` or `url`, not both. At most 8 rows, 8 buttons in a row, and 32 buttons. A split text reply puts the keyboard on the last bubble. A multipart upload sends `buttons` as a text field containing that JSON array.
+
+```bash
+curl -sS -X POST "$SEND_URL" \
+  -H "Authorization: Bearer $REPLY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id":"123","text":"Deploy the preview?","reply_to_message_id":10,"final":true,"buttons":[[{"text":"Approve","data":"approve"},{"text":"Cancel","data":"cancel"}]]}'
+```
+
+The bridge signs each `data` with `REPLY_TOKEN_SECRET`. The token is bound to the chat and, for a reply-token send, to the person that wake came from. It fits in Telegram's 64-byte `callback_data`, so a tap verifies on any instance. Buttons stay tappable for `REPLY_TOKEN_TTL_SECONDS` after the send. A URL button does not wake the bot.
+
+A tap is a new wake. `addressed_how` is `"callback"`. `callback.data` is the action, `callback.text` is the label, `callback.message_id` is the bot message, and `callback.message_text` is that message's full text or caption, up to Telegram's 4096-character limit. `from` is who tapped. `reply.token` is new. The bridge calls `answerCallbackQuery` immediately. The callback data has to be one of the buttons on that message; a token from a different keyboard in the same chat is ignored and does not use up that message's tap. The first accepted tap removes the keyboard. A second tap on that message answers "Already chosen." and does not wake again. A tap from anyone else answers "That button isn't for you." and does not wake. The allowlist still applies. An operator send made with `OUTBOUND_API_KEY` has no wake user, so its callback buttons are bound to the chat only: any allowlisted sender in that chat can tap.
+
+On Vercel and Node the one-tap claim lives in that process's memory, same as other dedupe. The signature check does not. A second instance can still accept a second tap until it sees the keyboard is gone. Cloudflare stores the claim in the chat's Durable Object.
 
 `/send` and `/send/media` share one final slot per wake:
 
@@ -349,14 +366,15 @@ npm run cf:dev
 npm run cf:deploy
 ```
 
-`set-webhook`, `set-commands`, `webhook-info`, `get-updates`, and `delete-webhook` read `.env`. `get-updates` calls `getUpdates` with no offset. `set-webhook` subscribes Telegram to `message` and `edited_message`, and refuses an invalid webhook secret or a non-https `PUBLIC_BASE_URL`. The scripts print Telegram's `ok`, `description`, and `result` fields.
+`set-webhook`, `set-commands`, `webhook-info`, `get-updates`, and `delete-webhook` read `.env`. `get-updates` calls `getUpdates` with no offset. `set-webhook` subscribes Telegram to `message`, `edited_message`, and `callback_query`, and refuses an invalid webhook secret or a non-https `PUBLIC_BASE_URL`. The scripts print Telegram's `ok`, `description`, and `result` fields. Run `set-webhook` again after upgrading so Telegram starts delivering button taps.
 
 ## Security
 
 - The bridge compares `X-Telegram-Bot-Api-Secret-Token` with `TELEGRAM_WEBHOOK_SECRET` in constant time. If the secret is unset or invalid, `/webhook` returns 503.
 - The Node server starts only with a valid webhook secret, `REPLY_TOKEN_SECRET`, and `PUBLIC_BASE_URL`. On Workers and Vercel, `/healthz` reports `ready: false` instead, and the bridge logs each dropped wake at `level: "error"`.
 - An empty allowlist denies everyone.
-- Reply tokens are HMAC-SHA256 over the chat, topic, wake id, and expiry, checked in constant time. A final send retires the token. A file URL is a separate HMAC (`f1~…`) over the same chat, topic, wake, and the Telegram file id. `GET /file` requires both, and the reply token's wake must be the one that signed the file. The long-lived `OUTBOUND_API_KEY` cannot fetch files.
+- Reply tokens are HMAC-SHA256 over the chat, topic, wake id, expiry, and, on new wakes, the sender's user id, checked in constant time. A final send retires the token. A file URL is a separate HMAC (`f1~…`) over the same chat, topic, wake, and the Telegram file id. `GET /file` requires both, and the reply token's wake must be the one that signed the file. The long-lived `OUTBOUND_API_KEY` cannot fetch files.
+- Inline button `callback_data` is a separate HMAC (`cb1`) over the chat, the owner (or the chat only, for an operator send), the expiry, and the action. A tap from another chat or person fails that check. The token must also be a button on the message Telegram delivered with the tap, so a token from another keyboard in the same chat cannot claim it. The first accepted tap claims the bot message and clears the keyboard. URL buttons are https only.
 - The bridge builds `reply.send_url`, `reply.send_media_url`, and attachment `file_url`s from `PUBLIC_BASE_URL` only. A file response is proxied. The bridge never redirects to `api.telegram.org`, because that URL contains the bot token.
 - Telegram `getFile` stops at 20 MiB (20971520 bytes). A larger file is described with `file_url: null` and `unavailable: "too_large"`. If Telegram still rejects the download, `GET /file` returns 413 `file_too_large`.
 - `POST /send/media` passes an https URL to Telegram, which downloads it. The bridge does not fetch that URL. It rejects non-https URLs, URLs with credentials, IP literals, localhost, and `api.telegram.org`. An upload is capped by `MAX_MEDIA_BYTES`.

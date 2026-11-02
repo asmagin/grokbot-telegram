@@ -62,5 +62,6 @@ describe("wake schema file", () => {
     expect(Object.keys(payload.reply).sort()).toEqual([...schema.properties.reply.required].sort());
     const messageRequired = (schema.properties as { message?: { required?: string[] } }).message?.required ?? [];
     expect(Object.keys(payload.message).sort()).toEqual([...messageRequired].sort());
+    expect(payload.callback).toBeNull();
   });
 });

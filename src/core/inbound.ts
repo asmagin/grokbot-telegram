@@ -1,13 +1,15 @@
 import { classifyAddress, messageText, senderUser, topicThreadId } from "./address.js";
 import { isAllowlisted } from "./allowlist.js";
-import { secretsEqual } from "./crypto.js";
+import { callbackButtonText } from "./buttons.js";
+import { canonicalId } from "./config.js";
+import { secretsEqual, verifyCallbackData } from "./crypto.js";
 import { safeErrorMessage } from "./log.js";
 import { runInBackground, type AppDeps } from "./deps.js";
 import { forwardToGrok } from "./grok.js";
 import { json, readLimitedBody } from "./http.js";
-import { buildWakeEvent, toContextMessage } from "./payload.js";
+import { buildCallbackWakeEvent, buildWakeEvent, toContextMessage } from "./payload.js";
 import { MESSAGE_CLAIM_TTL_MS, rateChatKey, rateUserKey, scopeKey } from "./store.js";
-import { fastGreetingReply } from "./text.js";
+import { cleanLabel, cleanText, fastGreetingReply } from "./text.js";
 import { TELEGRAM_SECRET_HEADER, type TelegramMessage, type TelegramUpdate, type TypingStart } from "./types.js";
 
 export async function handleWebhook(request: Request, deps: AppDeps): Promise<Response> {
@@ -74,6 +76,8 @@ async function handleClaimedUpdate(
   update: TelegramUpdate,
   now: number,
 ): Promise<Response> {
+  if (update.callback_query) return handleCallbackQuery(deps, update, now);
+
   if (update.channel_post || update.edited_channel_post) {
     deps.log({ event: "update_dropped", reason: "ignored_channel", update_id: update.update_id });
     return json(200, { ok: true });
@@ -228,8 +232,230 @@ async function handleClaimedUpdate(
     edited,
   });
 
-  runInBackground(deps, "wake_background_failed", () => deliverWake(deps, message, session, wake, chatId, threadId));
+  runInBackground(deps, "wake_background_failed", () => deliverWake(deps, message, session, wake, chatId, threadId, true));
   return json(200, { ok: true });
+}
+
+const TOAST_NOT_YOURS = "That button isn't for you.";
+const TOAST_EXPIRED = "That button expired.";
+const TOAST_TAKEN = "Already chosen.";
+
+/**
+ * A button tap. The callback_data is a signature over the chat, the owner, the
+ * expiry, and the action, so a tap from another chat or person cannot wake the
+ * bot. The signature does not name the message, and Telegram does not require
+ * the data to be one of that message's buttons, so the token also has to appear
+ * on the keyboard Telegram attached to this message. The first accepted tap
+ * claims that message; a second tap does not.
+ */
+async function handleCallbackQuery(
+  deps: AppDeps,
+  update: TelegramUpdate,
+  now: number,
+): Promise<Response> {
+  const query = update.callback_query;
+  const callbackId = query && typeof query.id === "string" && query.id.length > 0 && query.id.length <= 256
+    ? query.id
+    : null;
+  if (!query || !callbackId) {
+    deps.log({ event: "update_dropped", reason: "ignored_update", update_id: update.update_id });
+    return json(200, { ok: true });
+  }
+
+  const answer = (text?: string) => answerCallback(deps, callbackId, text);
+  const tapper = query.from;
+  const message = query.message;
+  if (!tapper || typeof tapper.id !== "number" || tapper.is_bot === true) {
+    await answer();
+    deps.log({
+      event: "update_dropped",
+      reason: tapper?.is_bot ? "ignored_bot" : "ignored_update",
+      update_id: update.update_id,
+    });
+    return json(200, { ok: true });
+  }
+  if (!message?.chat || typeof message.chat.id !== "number" || !Number.isSafeInteger(message.message_id)) {
+    await answer();
+    deps.log({ event: "update_dropped", reason: "ignored_update", update_id: update.update_id });
+    return json(200, { ok: true });
+  }
+
+  const chatId = canonicalId(String(message.chat.id));
+  const userId = canonicalId(String(tapper.id));
+  if (!chatId || !userId) {
+    await answer();
+    deps.log({ event: "update_dropped", reason: "ignored_update", update_id: update.update_id, chat_id: chatId });
+    return json(200, { ok: true });
+  }
+  if (!isAllowlisted(userId, chatId, deps.config)) {
+    await answer();
+    deps.log({
+      event: "update_dropped",
+      reason: "not_allowlisted",
+      update_id: update.update_id,
+      chat_id: chatId,
+      user_id: userId,
+    });
+    return json(200, { ok: true });
+  }
+
+  const data = typeof query.data === "string" ? query.data : "";
+  if (!deps.config.replyTokenSecret || data.length < 1 || data.length > 64) {
+    await answer();
+    deps.log({
+      event: "update_dropped",
+      reason: deps.config.replyTokenSecret ? "callback_malformed" : "reply_not_configured",
+      level: deps.config.replyTokenSecret ? "info" : "error",
+      update_id: update.update_id,
+      chat_id: chatId,
+      user_id: userId,
+    });
+    return json(200, { ok: true });
+  }
+
+  const verified = await verifyCallbackData(deps.config.replyTokenSecret, data, { chatId, userId, nowMs: now });
+  if (!verified.ok) {
+    const reason = verified.reason === "expired"
+      ? "callback_expired"
+      : verified.reason === "bad_signature" ? "callback_rejected" : "callback_malformed";
+    const toast = reason === "callback_expired" ? TOAST_EXPIRED : reason === "callback_rejected" ? TOAST_NOT_YOURS : undefined;
+    await answer(toast);
+    deps.log({ event: "update_dropped", reason, update_id: update.update_id, chat_id: chatId, user_id: userId });
+    return json(200, { ok: true });
+  }
+  // Data we sign is already free of control characters. Anything else is not a token we issued.
+  if (cleanText(verified.data, 64) !== verified.data) {
+    await answer();
+    deps.log({ event: "update_dropped", reason: "callback_malformed", update_id: update.update_id, chat_id: chatId, user_id: userId });
+    return json(200, { ok: true });
+  }
+
+  // A valid token from another keyboard in this chat must not wake or claim this message.
+  const rawLabel = callbackButtonText(message.reply_markup, data);
+  if (rawLabel === null) {
+    await answer();
+    deps.log({
+      event: "update_dropped",
+      reason: "callback_not_on_message",
+      update_id: update.update_id,
+      chat_id: chatId,
+      user_id: userId,
+      message_id: message.message_id,
+    });
+    return json(200, { ok: true });
+  }
+
+  const chatRate = await deps.store.hitRate(rateChatKey(chatId), now, deps.config.rateLimitWindowMs, deps.config.rateLimitMax);
+  const userRate = await deps.store.hitRate(rateUserKey(chatId, userId), now, deps.config.rateLimitWindowMs, deps.config.rateLimitMax);
+  if (!chatRate.allowed || !userRate.allowed) {
+    await answer();
+    deps.log({
+      event: "update_dropped",
+      reason: "rate_limited",
+      update_id: update.update_id,
+      chat_id: chatId,
+      user_id: userId,
+    });
+    return json(200, { ok: true });
+  }
+
+  const threadId = topicThreadId(message);
+  const label = cleanLabel(rawLabel, 64) || verified.data;
+  const wake = await buildCallbackWakeEvent({
+    config: deps.config,
+    chat: message.chat,
+    threadId,
+    from: tapper,
+    messageId: message.message_id,
+    date: typeof message.date === "number" ? message.date : null,
+    messageText: messageText(message),
+    label,
+    data: verified.data,
+    updateId: update.update_id,
+    nowMs: now,
+  });
+  if (!wake) {
+    await answer();
+    deps.log({
+      event: "wake_skipped",
+      level: "error",
+      reason: "reply_not_configured",
+      update_id: update.update_id,
+      chat_id: chatId,
+    });
+    return json(200, { ok: true });
+  }
+
+  const ttlMs = Math.max(1000, verified.exp * 1000 - now);
+  const claim = await deps.store.claimCallback(chatId, message.message_id, now, ttlMs);
+  if (claim === "duplicate") {
+    await answer(TOAST_TAKEN);
+    await clearKeyboard(deps, chatId, message.message_id);
+    deps.log({
+      event: "update_dropped",
+      reason: "callback_duplicate",
+      update_id: update.update_id,
+      chat_id: chatId,
+      user_id: userId,
+      message_id: message.message_id,
+    });
+    return json(200, { ok: true });
+  }
+
+  await answer();
+  await clearKeyboard(deps, chatId, message.message_id);
+
+  const scope = scopeKey(chatId, threadId);
+  const tokenExpiry = Date.parse(wake.reply.expires_at);
+  // No reaction on the bot's own message. Typing is the acknowledgement; the callback answer stops the spinner.
+  const session: TypingStart = {
+    scopeKey: scope,
+    chatId,
+    threadId,
+    refreshMs: deps.config.typingRefreshMs,
+    wakeId: wake.reply.wake_id,
+    messageId: null,
+    reaction: null,
+    draft: false,
+    startedAt: now,
+    leaseMs: deps.config.typingLeaseMs,
+    deadline: Number.isFinite(tokenExpiry)
+      ? Math.min(now + deps.config.typingMaxMs, tokenExpiry)
+      : now + deps.config.typingMaxMs,
+  };
+  deps.log({
+    event: "wake",
+    update_id: update.update_id,
+    chat_id: chatId,
+    user_id: userId,
+    addressed_how: "callback",
+    edited: false,
+    message_id: message.message_id,
+  });
+  runInBackground(deps, "wake_background_failed", () => deliverWake(deps, message, session, wake, chatId, threadId, false));
+  return json(200, { ok: true });
+}
+
+async function answerCallback(deps: AppDeps, callbackId: string, text?: string): Promise<void> {
+  try {
+    const result = await deps.telegram.answerCallbackQuery(text ? { callback_query_id: callbackId, text } : { callback_query_id: callbackId });
+    if (!result.ok) deps.log({ event: "callback_answer_failed", status: result.status });
+  } catch (err) {
+    deps.log({ event: "callback_answer_failed", error: err instanceof Error ? err.name : "error" });
+  }
+}
+
+async function clearKeyboard(deps: AppDeps, chatId: string, messageId: number): Promise<void> {
+  try {
+    const result = await deps.telegram.editMessageReplyMarkup({
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: [] },
+    });
+    if (!result.ok) deps.log({ event: "callback_keyboard_clear_failed", chat_id: chatId, status: result.status });
+  } catch (err) {
+    deps.log({ event: "callback_keyboard_clear_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+  }
 }
 
 /**
@@ -261,6 +487,7 @@ async function deliverWake(
   wake: NonNullable<Awaited<ReturnType<typeof buildWakeEvent>>>,
   chatId: string,
   threadId: number | null,
+  ack: boolean,
 ): Promise<void> {
   // Reaction, typing and the optional ack are cosmetic. A failure there must not stop the wake.
   try {
@@ -268,7 +495,7 @@ async function deliverWake(
   } catch (err) {
     deps.log({ event: "typing_failed", chat_id: chatId, error: safeErrorMessage(err, []) });
   }
-  if (deps.config.bridgeAck) {
+  if (ack && deps.config.bridgeAck) {
     deps.log({ event: "bridge_ack", chat_id: chatId, update_id: wake.update_id });
     await deps.telegram.sendMessage({
       chat_id: chatId,

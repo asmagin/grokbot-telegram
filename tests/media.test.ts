@@ -3,7 +3,7 @@ import { buildDeps } from "../src/core/deps.js";
 import { handleRequest } from "../src/core/handler.js";
 import { routeBodyLimit } from "../src/core/http.js";
 import { normalizePublicMediaUrl } from "../src/core/media.js";
-import { TELEGRAM_GET_FILE_MAX_BYTES, type WakeEvent } from "../src/core/types.js";
+import { SCHEMA_VERSION, TELEGRAM_GET_FILE_MAX_BYTES, type WakeEvent } from "../src/core/types.js";
 import {
   createFetchMock,
   createTestApp,
@@ -74,7 +74,8 @@ describe("incoming attachments", () => {
   it("uses the caption as text and describes the largest photo without the file id or bot token", async () => {
     const app = mediaApp();
     const payload = await photoWake(app);
-    expect(payload.schema_version).toBe(3);
+    expect(payload.schema_version).toBe(SCHEMA_VERSION);
+    expect(payload.callback).toBeNull();
     expect(payload.message.text).toBe("see this");
     expect(payload.message.media).toEqual(["photo"]);
     expect(payload.message.attachments).toHaveLength(1);
