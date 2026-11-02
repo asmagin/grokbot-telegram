@@ -461,3 +461,59 @@ npm run cf:deploy
 [MIT](LICENSE). Copyright grokbot-telegram contributors.
 
 - Speech bytes go to `https://api.x.ai/v1/stt` only when `XAI_API_KEY` is set, only for an allowlisted chat, and only for a voice, audio, or video note inside the duration and size caps. The request does not follow redirects. The key is not in the wake payload. Logs record the outcome, not the transcript and not the key.
+
+## Multiple Telegram bots
+
+One deployment can serve multiple bots on Node, Cloudflare Workers, or Vercel.
+Set `TELEGRAM_BOTS` in the gitignored `.env` as a JSON object keyed by stable names.
+The example below contains placeholders only; replace them locally with each bot's
+credentials. Store the complete `TELEGRAM_BOTS` value as a **secret**, not a public
+host variable or a committed Wrangler setting.
+
+```dotenv
+PUBLIC_BASE_URL=https://your-bridge.example
+TELEGRAM_BOTS='{"alpha":{"TELEGRAM_BOT_TOKEN":"111:replace_alpha_token","TELEGRAM_BOT_USERNAME":"alpha_bot","TELEGRAM_WEBHOOK_SECRET":"replace_alpha_webhook_secret","REPLY_TOKEN_SECRET":"replace_alpha_reply_secret_at_least_32_chars","GROK_WEBHOOK_URL":"https://example.com/alpha-webhook","GROK_WEBHOOK_SENDER_KEY":"replace_alpha_sender_key","ALLOWLIST_USER_IDS":"42"},"beta":{"TELEGRAM_BOT_TOKEN":"222:replace_beta_token","TELEGRAM_BOT_USERNAME":"beta_bot","TELEGRAM_WEBHOOK_SECRET":"replace_beta_webhook_secret","REPLY_TOKEN_SECRET":"replace_beta_reply_secret_at_least_32_chars","GROK_WEBHOOK_URL":"https://example.com/beta-webhook","GROK_WEBHOOK_SENDER_KEY":"replace_beta_sender_key","ALLOWLIST_USER_IDS":"42"}}'
+```
+
+Names must be 1–32 lowercase letters, digits, underscores or hyphens, starting
+with a letter or digit. Each bot gets `/bots/<name>/webhook`, `/bots/<name>/send`,
+and the corresponding media, edit, file, typing, and health routes. A shared
+`PATH_PREFIX`, when configured, precedes `/bots/<name>`. `PUBLIC_BASE_URL` keeps
+its existing meaning. Do not include the bot path in it. Vercel's bundled rewrite
+supports the default empty prefix; custom prefixes need matching rewrites.
+
+Register each bot separately after deployment:
+
+```sh
+npm run set-webhook -- --bot alpha
+npm run set-commands -- --bot alpha
+npm run set-webhook -- --bot beta
+npm run set-commands -- --bot beta
+```
+
+`webhook-info`, `get-updates`, and `delete-webhook` also accept `--bot <name>`.
+Multi-bot mode requires explicit selection; scripts never default to another bot.
+Each routine should use its bot's reply URLs from the wake payload and retain the
+bridge origin in its saved prompt.
+
+Each entry supplies its own bot token, username, webhook secret, reply secret,
+Grok webhook URL/sender key, allowlists, optional bot ID, and optional outbound
+key. These settings do not inherit from the legacy top-level configuration.
+An empty allowlist still denies everyone. Other tuning settings inherit from
+the shared environment and can be overridden per entry. `PUBLIC_BASE_URL` and
+`PATH_PREFIX` are shared and cannot be overridden inside entries.
+
+Bot tokens, webhook secrets, reply secrets, and any outbound keys must be unique
+across bots. Invalid registry configuration fails closed without printing its
+contents. Each bot has isolated deduplication, rate limits, context, bursts,
+reply ownership, and typing state. Cloudflare also persists the bot identity so
+alarms use the correct bot after eviction. Wake schema v4 is unchanged;
+`idempotency_key` becomes `<name>:<update_id>` in multi-bot mode. `/healthz`
+reports aggregate readiness; `/bots/<name>/healthz` gives per-bot details.
+
+Unset `TELEGRAM_BOTS` to retain the original single-bot settings, routes and
+storage names. Enabling multi-bot mode replaces the legacy routes with named
+routes and starts separate state; old reply URLs are no longer active. Keep
+bot names stable and do not reassign a name to a different bot. Node and Vercel
+retain their existing in-memory persistence limitations; Cloudflare uses
+separate Durable Object namespaces per bot.

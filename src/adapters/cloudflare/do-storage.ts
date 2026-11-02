@@ -1,3 +1,4 @@
+import { loadBots } from "../../core/bots.js";
 import {
   normalizeScope,
   startWake,
@@ -73,6 +74,15 @@ export async function handleDoFetch(
   env: Record<string, unknown>,
   request: Request,
 ): Promise<Response> {
+  const botId = request.headers.get("x-bridge-bot");
+  const savedBot = await storage.get<string>("bot-id");
+  if (savedBot && savedBot !== botId) return Response.json({ ok: false }, { status: 403 });
+  if (botId) {
+    const bot = loadBots(env).find((entry) => entry.id === botId);
+    if (!bot) return Response.json({ ok: false }, { status: 503 });
+    if (!savedBot) await storage.put("bot-id", botId);
+    env = bot.env;
+  }
   let body: DoOp;
   try {
     body = (await request.json()) as DoOp;
@@ -142,6 +152,12 @@ export async function handleDoFetch(
  * sends one typing action per chat (and topic), however many wakes it has.
  */
 export async function handleDoAlarm(storage: DoStorage, env: Record<string, unknown>, now = Date.now()): Promise<void> {
+  const botId = await storage.get<string>("bot-id");
+  if (botId) {
+    const bot = loadBots(env).find((entry) => entry.id === botId);
+    if (!bot) { await storage.deleteAlarm(); return; }
+    env = bot.env;
+  }
   const scopes = typingScopes(storage);
   const effects = doEffects(env);
   const map = (await storage.get<Record<string, unknown>>(TYPING_KEY)) ?? {};

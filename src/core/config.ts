@@ -2,6 +2,7 @@ import { cleanText } from "./text.js";
 import { DEFAULT_WAKE_COMMANDS, TELEGRAM_REACTION_EMOJI } from "./types.js";
 
 export interface Config {
+  botName?: string;
   telegramBotToken: string;
   telegramWebhookSecret: string;
   telegramBotUsername: string;
@@ -224,6 +225,7 @@ export function loadConfig(env: EnvSource): Config {
   const progressReaction = parseReaction(readString(env, "PROGRESS_REACTION"), problems);
   const speech = loadSpeech(env, problems);
   return {
+    botName: readString(env, "BRIDGE_BOT_NAME"),
     telegramBotToken: readString(env, "TELEGRAM_BOT_TOKEN"),
     telegramWebhookSecret: isValidWebhookSecret(webhookSecret) ? webhookSecret : "",
     telegramBotUsername: /^[A-Za-z0-9_]{1,32}$/.test(username) ? username : "",
