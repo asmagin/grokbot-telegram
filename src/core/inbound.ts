@@ -243,7 +243,10 @@ const TOAST_TAKEN = "Already chosen.";
 /**
  * A button tap. The callback_data is a signature over the chat, the owner, the
  * expiry, and the action, so a tap from another chat or person cannot wake the
- * bot. The first accepted tap claims the bot message; a second tap does not.
+ * bot. The signature does not name the message, and Telegram does not require
+ * the data to be one of that message's buttons, so the token also has to appear
+ * on the keyboard Telegram attached to this message. The first accepted tap
+ * claims that message; a second tap does not.
  */
 async function handleCallbackQuery(
   deps: AppDeps,
@@ -327,6 +330,21 @@ async function handleCallbackQuery(
     return json(200, { ok: true });
   }
 
+  // A valid token from another keyboard in this chat must not wake or claim this message.
+  const rawLabel = callbackButtonText(message.reply_markup, data);
+  if (rawLabel === null) {
+    await answer();
+    deps.log({
+      event: "update_dropped",
+      reason: "callback_not_on_message",
+      update_id: update.update_id,
+      chat_id: chatId,
+      user_id: userId,
+      message_id: message.message_id,
+    });
+    return json(200, { ok: true });
+  }
+
   const chatRate = await deps.store.hitRate(rateChatKey(chatId), now, deps.config.rateLimitWindowMs, deps.config.rateLimitMax);
   const userRate = await deps.store.hitRate(rateUserKey(chatId, userId), now, deps.config.rateLimitWindowMs, deps.config.rateLimitMax);
   if (!chatRate.allowed || !userRate.allowed) {
@@ -342,8 +360,7 @@ async function handleCallbackQuery(
   }
 
   const threadId = topicThreadId(message);
-  const rawLabel = callbackButtonText(message.reply_markup, data);
-  const label = (rawLabel && cleanLabel(rawLabel, 64)) || verified.data;
+  const label = cleanLabel(rawLabel, 64) || verified.data;
   const wake = await buildCallbackWakeEvent({
     config: deps.config,
     chat: message.chat,

@@ -149,7 +149,12 @@ export async function keyboardForSend(options: {
   return { ok: true, markup: { inline_keyboard: inlineKeyboard } };
 }
 
-/** The label Telegram showed for this callback_data, if the message still has the keyboard. */
+/**
+ * Label of the button that carries this callback_data.
+ * Null when this message's keyboard does not. Telegram does not require
+ * callback_query.data to be one of those buttons, so a null here means the
+ * token is not this message's and must not be accepted.
+ */
 export function callbackButtonText(markup: TelegramReplyMarkup | undefined, callbackData: string): string | null {
   const rows = markup?.inline_keyboard;
   if (!Array.isArray(rows)) return null;
@@ -157,9 +162,8 @@ export function callbackButtonText(markup: TelegramReplyMarkup | undefined, call
     if (!Array.isArray(row)) continue;
     for (const button of row) {
       if (!button || typeof button !== "object") continue;
-      if (button.callback_data === callbackData && typeof button.text === "string" && button.text.trim()) {
-        return button.text;
-      }
+      if (button.callback_data !== callbackData) continue;
+      return typeof button.text === "string" ? button.text : "";
     }
   }
   return null;

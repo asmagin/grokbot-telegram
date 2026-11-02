@@ -411,6 +411,95 @@ describe("callback queries", () => {
     expect(tap?.from?.id).toBe("99");
     expect(tap?.callback).toMatchObject({ data: "approve", text: "Approve", message_text: "Take the ticket?" });
   });
+
+  it("does not let a same-chat token claim a different message's keyboard", async () => {
+    const app = createTestApp({ env: testEnv({ OUTBOUND_API_KEY: "outbound-key-0123456789abcdef0123456789" }) });
+    await postUpdate(app.deps, app.tasks, groupUpdate({
+      text: "@testbot choose",
+      updateId: 3,
+      entities: [{ type: "mention", offset: 0, length: 8 }],
+    }));
+    const wake = wakes(app.calls).at(-1);
+    const userSent = await handleRequest(new Request("https://bridge.example/send", {
+      method: "POST",
+      headers: { authorization: `Bearer ${wake?.reply.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: "-500",
+        text: "Keep the draft?",
+        final: true,
+        buttons: [[{ text: "Keep", data: "keep" }]],
+      }),
+    }), app.deps);
+    expect(userSent.status).toBe(200);
+    const userMessageId = ((await userSent.json()) as { message_ids: number[] }).message_ids[0] ?? 0;
+    const userMarkup = (callsEnding(app.calls, "sendMessage").at(-1)?.body as { reply_markup: InlineKeyboardMarkup }).reply_markup;
+    const userToken = userMarkup.inline_keyboard[0]?.[0]?.callback_data ?? "";
+
+    const operatorSent = await handleRequest(new Request("https://bridge.example/send", {
+      method: "POST",
+      headers: { authorization: "Bearer outbound-key-0123456789abcdef0123456789", "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: "-500",
+        text: "Take the ticket?",
+        buttons: [[{ text: "Approve", data: "approve" }]],
+      }),
+    }), app.deps);
+    expect(operatorSent.status).toBe(200);
+    const operatorMarkup = (callsEnding(app.calls, "sendMessage").at(-1)?.body as { reply_markup: InlineKeyboardMarkup }).reply_markup;
+    const operatorToken = operatorMarkup.inline_keyboard[0]?.[0]?.callback_data ?? "";
+    expect(operatorToken).not.toBe(userToken);
+    const before = wakes(app.calls).length;
+    const clearsBefore = callsEnding(app.calls, "editMessageReplyMarkup").length;
+
+    const reused = await postUpdate(app.deps, app.tasks, callbackUpdate({
+      updateId: 80,
+      data: operatorToken,
+      messageId: userMessageId,
+      chatId: -500,
+      chatType: "supergroup",
+      userId: 99,
+      text: "Keep the draft?",
+      buttonText: "Keep",
+      markup: userMarkup,
+    }));
+    expect(reused.status).toBe(200);
+    expect(wakes(app.calls)).toHaveLength(before);
+    expect(callsEnding(app.calls, "editMessageReplyMarkup")).toHaveLength(clearsBefore);
+    expect(callsEnding(app.calls, "answerCallbackQuery").at(-1)?.body).toEqual({ callback_query_id: "cq-80" });
+
+    const missingKeyboard = await postUpdate(app.deps, app.tasks, callbackUpdate({
+      updateId: 81,
+      data: userToken,
+      messageId: userMessageId,
+      chatId: -500,
+      chatType: "supergroup",
+      userId: 42,
+      text: "Keep the draft?",
+      buttonText: "Keep",
+      markup: "omit",
+    }));
+    expect(missingKeyboard.status).toBe(200);
+    expect(wakes(app.calls)).toHaveLength(before);
+
+    const owner = await postUpdate(app.deps, app.tasks, callbackUpdate({
+      updateId: 82,
+      data: userToken,
+      messageId: userMessageId,
+      chatId: -500,
+      chatType: "supergroup",
+      userId: 42,
+      text: "Keep the draft?",
+      buttonText: "Keep",
+    }));
+    expect(owner.status).toBe(200);
+    expect(wakes(app.calls).at(-1)?.callback).toMatchObject({
+      data: "keep",
+      text: "Keep",
+      message_id: userMessageId,
+      message_text: "Keep the draft?",
+    });
+    expect(callsEnding(app.calls, "editMessageReplyMarkup").at(-1)?.body).toMatchObject({ message_id: userMessageId });
+  });
 });
 
 function callbackUpdate(options: {
@@ -423,7 +512,12 @@ function callbackUpdate(options: {
   chatId?: number;
   chatType?: string;
   threadId?: number;
+  /** "omit" drops reply_markup. An object is the keyboard Telegram attached to this message. */
+  markup?: "omit" | InlineKeyboardMarkup;
 }): unknown {
+  const replyMarkup = options.markup === "omit"
+    ? undefined
+    : options.markup ?? { inline_keyboard: [[{ text: options.buttonText, callback_data: options.data }]] };
   return {
     update_id: options.updateId,
     callback_query: {
@@ -437,9 +531,7 @@ function callbackUpdate(options: {
         from: { id: 999, is_bot: true, first_name: "Bot" },
         chat: { id: options.chatId ?? 42, type: options.chatType ?? "private" },
         ...(options.threadId !== undefined ? { message_thread_id: options.threadId, is_topic_message: true } : {}),
-        reply_markup: {
-          inline_keyboard: [[{ text: options.buttonText, callback_data: options.data }]],
-        },
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       },
     },
   };
