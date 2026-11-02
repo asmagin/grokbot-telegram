@@ -1,10 +1,10 @@
-import type { Config } from "./config.js";
+import { canonicalId, type Config } from "./config.js";
 import { signReplyToken } from "./crypto.js";
 import { messageText, senderUser, topicThreadId } from "./address.js";
 import { describeAttachments } from "./media.js";
 import { cleanLabel, cleanText, joinUrl, mediaKinds } from "./text.js";
-import type { ContextMessage, PublicUser, ReplyClaims, TelegramMessage, TelegramUser, WakeEvent } from "./types.js";
-import { SCHEMA_VERSION } from "./types.js";
+import type { ContextMessage, PublicUser, ReplyClaims, TelegramChat, TelegramMessage, TelegramUser, WakeEvent, WakeReply } from "./types.js";
+import { SCHEMA_VERSION, TELEGRAM_TEXT_LIMIT } from "./types.js";
 
 export const MESSAGE_TEXT_LIMIT = 4000;
 export const CONTEXT_TEXT_LIMIT = 1000;
@@ -68,30 +68,20 @@ export async function buildWakeEvent(options: {
   nowMs: number;
 }): Promise<WakeEvent | null> {
   const { config, message } = options;
-  // Never derive send_url from the request's Host header: the assistant sends its
-  // bearer token to that URL. Only a configured, validated origin is used.
-  if (!config.replyTokenSecret || !config.publicBaseUrl) return null;
-  const base = config.publicBaseUrl;
   const chatId = String(message.chat.id);
   const threadId = topicThreadId(message);
-  const wakeId = crypto.randomUUID();
-  const expSeconds = Math.floor(options.nowMs / 1000) + config.replyTokenTtlSeconds;
-  const claims: ReplyClaims = {
-    v: 1,
-    chat_id: chatId,
-    thread_id: threadId,
-    wake_id: wakeId,
-    exp: expSeconds,
-  };
-  const token = await signReplyToken(config.replyTokenSecret, claims);
+  const sender = senderUser(message);
+  const userId = sender ? canonicalId(String(sender.id)) : null;
+  const signed = await signedReply(config, chatId, threadId, userId, options.nowMs);
+  if (!signed) return null;
   const attachments = await describeAttachments(message, {
     secret: config.replyTokenSecret,
-    publicBaseUrl: base,
+    publicBaseUrl: config.publicBaseUrl,
     pathPrefix: config.pathPrefix,
     chatId,
     threadId,
-    wakeId,
-    expSeconds,
+    wakeId: signed.wakeId,
+    expSeconds: signed.expSeconds,
   });
   const replyTo = message.reply_to_message
     ? {
@@ -125,7 +115,98 @@ export async function buildWakeEvent(options: {
       attachments,
       reply_to: replyTo,
     },
+    callback: null,
     short_term: options.shortTerm.map(cleanContextMessage),
+    reply: signed.reply,
+  };
+}
+
+/** A button tap. `data` is the action the bot attached; `label` is what the person saw. */
+export async function buildCallbackWakeEvent(options: {
+  config: Config;
+  chat: TelegramChat;
+  threadId: number | null;
+  from: TelegramUser;
+  messageId: number;
+  date: number | null;
+  messageText: string;
+  label: string;
+  data: string;
+  updateId: number;
+  nowMs: number;
+}): Promise<WakeEvent | null> {
+  const chatId = String(options.chat.id);
+  const userId = canonicalId(String(options.from.id));
+  const signed = await signedReply(options.config, chatId, options.threadId, userId, options.nowMs);
+  if (!signed) return null;
+  const label = cleanLabel(options.label, 64) || cleanText(options.data, 64);
+  return {
+    schema_version: SCHEMA_VERSION,
+    untrusted_content_notice: UNTRUSTED_CONTENT_NOTICE,
+    idempotency_key: String(options.updateId),
+    update_id: options.updateId,
+    timestamp: new Date(options.nowMs).toISOString(),
+    edited: false,
+    addressed_how: "callback",
+    command: null,
+    chat: {
+      id: chatId,
+      type: options.chat.type,
+      title: cleanLabel(options.chat.title, 128),
+      username: cleanLabel(options.chat.username, 32),
+    },
+    from: toPublicUser(options.from),
+    message: {
+      message_id: options.messageId,
+      text: label,
+      date: options.date,
+      message_thread_id: options.threadId,
+      media: [],
+      attachments: [],
+      reply_to: null,
+    },
+    callback: {
+      data: options.data,
+      text: label,
+      message_id: options.messageId,
+      // The whole bubble the button was on. User wakes cap text at 4000; this one
+      // does not, because a tap has no other copy of the message and Telegram allows 4096.
+      message_text: cleanText(options.messageText, TELEGRAM_TEXT_LIMIT),
+    },
+    short_term: [],
+    reply: signed.reply,
+  };
+}
+
+/**
+ * A fresh reply token. `userId` is written into the token when we know who the
+ * wake is for, so a button sent later can be bound to that person on any instance.
+ */
+async function signedReply(
+  config: Config,
+  chatId: string,
+  threadId: number | null,
+  userId: string | null,
+  nowMs: number,
+): Promise<{ wakeId: string; expSeconds: number; reply: WakeReply } | null> {
+  // Never derive send_url from the request's Host header: the assistant sends its
+  // bearer token to that URL. Only a configured, validated origin is used.
+  if (!config.replyTokenSecret || !config.publicBaseUrl) return null;
+  const wakeId = crypto.randomUUID();
+  const expSeconds = Math.floor(nowMs / 1000) + config.replyTokenTtlSeconds;
+  const claims: ReplyClaims = {
+    v: 1,
+    chat_id: chatId,
+    thread_id: threadId,
+    wake_id: wakeId,
+    exp: expSeconds,
+    ...(userId ? { user_id: userId } : {}),
+  };
+  const token = await signReplyToken(config.replyTokenSecret, claims);
+  const base = config.publicBaseUrl;
+  return {
+    wakeId,
+    expSeconds,
     reply: {
       token,
       expires_at: new Date(expSeconds * 1000).toISOString(),

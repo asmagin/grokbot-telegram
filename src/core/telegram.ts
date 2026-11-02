@@ -2,7 +2,7 @@ import { isPlausibleBotToken } from "./config.js";
 import { isPlausibleFileId } from "./crypto.js";
 import { mayHaveBeenReceived } from "./http.js";
 import { isSafeTelegramFilePath } from "./media.js";
-import { TELEGRAM_GET_FILE_MAX_BYTES, type SendMediaKind } from "./types.js";
+import { TELEGRAM_GET_FILE_MAX_BYTES, type InlineKeyboardMarkup, type SendMediaKind } from "./types.js";
 
 export interface SendMessageInput {
   chat_id: string;
@@ -11,6 +11,7 @@ export interface SendMessageInput {
   reply_to_message_id?: number;
   /** Telegram: "Sends the message silently. Users will receive a notification with no sound." */
   disable_notification?: boolean;
+  reply_markup?: InlineKeyboardMarkup;
 }
 
 export type SendMessageResult =
@@ -62,6 +63,14 @@ export interface TelegramClient {
     message_thread_id?: number;
     text?: string;
   }): Promise<CallResult>;
+  /** Stop the client's loading spinner. `text` is a toast, not a modal. */
+  answerCallbackQuery(input: { callback_query_id: string; text?: string }): Promise<CallResult>;
+  /** Replace or clear the inline keyboard on a message the bot sent. */
+  editMessageReplyMarkup(input: {
+    chat_id: string;
+    message_id: number;
+    reply_markup: InlineKeyboardMarkup;
+  }): Promise<CallResult>;
 }
 
 export interface SendMediaInput {
@@ -73,6 +82,7 @@ export interface SendMediaInput {
   message_thread_id?: number;
   reply_to_message_id?: number;
   disable_notification?: boolean;
+  reply_markup?: InlineKeyboardMarkup;
 }
 
 export type GetFileResult =
@@ -202,11 +212,13 @@ export function createTelegramClient(options: {
     reply_to_message_id?: number;
     disable_notification?: boolean;
     caption?: string;
+    reply_markup?: InlineKeyboardMarkup;
   }): Record<string, unknown> {
     const payload: Record<string, unknown> = {};
     if (input.caption) payload.caption = input.caption;
     if (input.message_thread_id !== undefined) payload.message_thread_id = input.message_thread_id;
     if (input.disable_notification !== undefined) payload.disable_notification = input.disable_notification;
+    if (input.reply_markup) payload.reply_markup = input.reply_markup;
     if (input.reply_to_message_id !== undefined) {
       // If the original message was deleted, still deliver the answer.
       payload.reply_parameters = {
@@ -254,7 +266,8 @@ export function createTelegramClient(options: {
           bytes.set(file.bytes);
           form.set(field, new Blob([bytes], { type: file.mime || "application/octet-stream" }), file.filename);
           for (const [key, value] of Object.entries(extra)) {
-            if (key === "reply_parameters") form.set(key, JSON.stringify(value));
+            // Telegram wants these objects as JSON strings inside multipart.
+            if (key === "reply_parameters" || key === "reply_markup") form.set(key, JSON.stringify(value));
             else form.set(key, String(value));
           }
           return { body: form, json: false };
@@ -345,6 +358,18 @@ export function createTelegramClient(options: {
       };
       if (input.message_thread_id !== undefined) payload.message_thread_id = input.message_thread_id;
       return simpleCall("sendMessageDraft", payload);
+    },
+    async answerCallbackQuery(input) {
+      const payload: Record<string, unknown> = { callback_query_id: input.callback_query_id };
+      if (input.text) payload.text = input.text;
+      return simpleCall("answerCallbackQuery", payload);
+    },
+    async editMessageReplyMarkup(input) {
+      return simpleCall("editMessageReplyMarkup", {
+        chat_id: input.chat_id,
+        message_id: input.message_id,
+        reply_markup: input.reply_markup,
+      });
     },
   };
 

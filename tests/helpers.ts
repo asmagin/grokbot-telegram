@@ -65,10 +65,10 @@ export function createFetchMock(handler?: (call: RecordedCall) => Response | Pro
 /** Telegram and Grok Bot both accept everything. */
 export function defaultResponse(call: RecordedCall, count: number): Response {
   const url = call.url;
-  if (url.includes("api.telegram.org") && /\/(sendChatAction|setMessageReaction|sendMessageDraft)$/.test(url)) {
+  if (url.includes("api.telegram.org") && /\/(sendChatAction|setMessageReaction|sendMessageDraft|answerCallbackQuery|editMessageReplyMarkup)$/.test(url)) {
     return Response.json({ ok: true, result: true });
   }
-  if (url.includes("api.telegram.org") && url.endsWith("/sendMessage")) {
+  if (url.includes("api.telegram.org") && /\/(sendMessage|sendPhoto|sendDocument)$/.test(url)) {
     return Response.json({ ok: true, result: { message_id: 70 + count } });
   }
   if (url.includes("api.telegram.org") && url.endsWith("/editMessageText")) {

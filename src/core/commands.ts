@@ -12,7 +12,7 @@ export function setWebhookBody(webhookUrl: string, secretToken: string): {
   return {
     url: webhookUrl,
     secret_token: secretToken,
-    allowed_updates: ["message", "edited_message"],
+    allowed_updates: ["message", "edited_message", "callback_query"],
     drop_pending_updates: false,
   };
 }

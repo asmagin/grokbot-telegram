@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 3 as const;
+export const SCHEMA_VERSION = 4 as const;
 
 export const TELEGRAM_SECRET_HEADER = "x-telegram-bot-api-secret-token";
 
@@ -87,6 +87,25 @@ export interface TelegramMessage {
   contact?: unknown;
   location?: unknown;
   poll?: unknown;
+  /** Present when this message carries an inline keyboard. */
+  reply_markup?: TelegramReplyMarkup;
+}
+
+export interface TelegramInlineButton {
+  text?: string;
+  callback_data?: string;
+  url?: string;
+}
+
+export interface TelegramReplyMarkup {
+  inline_keyboard?: TelegramInlineButton[][];
+}
+
+export interface TelegramCallbackQuery {
+  id?: string;
+  from?: TelegramUser;
+  message?: TelegramMessage;
+  data?: string;
 }
 
 export interface TelegramUpdate {
@@ -95,6 +114,7 @@ export interface TelegramUpdate {
   edited_message?: TelegramMessage;
   channel_post?: TelegramMessage;
   edited_channel_post?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 }
 
 export interface PublicUser {
@@ -170,7 +190,7 @@ export interface WakeEvent {
   update_id: number;
   timestamp: string;
   edited: boolean;
-  addressed_how: "private" | "mention" | "command" | "reply";
+  addressed_how: AddressHow | "callback";
   command: string | null;
   chat: {
     id: string;
@@ -188,6 +208,8 @@ export interface WakeEvent {
     attachments: WakeAttachment[];
     reply_to: ReplyTo | null;
   };
+  /** Null when this wake is a message. An object when it is a button tap. */
+  callback: WakeCallback | null;
   short_term: ContextMessage[];
   reply: WakeReply;
 }
@@ -242,9 +264,37 @@ export interface ReplyClaims {
   thread_id: number | null;
   wake_id: string;
   exp: number;
+  /**
+   * The person this wake is for. New wakes set it so a later button can be
+   * bound to them without a store lookup. Tokens minted before that omit it.
+   */
+  user_id?: string;
 }
 
-export type AddressHow = WakeEvent["addressed_how"];
+/** One inline button the bridge sends to Telegram. */
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+  url?: string;
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+/**
+ * Set on a button-tap wake. Null on an ordinary message.
+ * `message_text` is the bot message the button was attached to.
+ */
+export interface WakeCallback {
+  data: string;
+  text: string;
+  message_id: number;
+  message_text: string;
+}
+
+/** How a person addressed the bot in a message. Button taps are not in this set. */
+export type AddressHow = "private" | "mention" | "command" | "reply";
 
 export interface AddressResult {
   addressed: boolean;

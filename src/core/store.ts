@@ -11,6 +11,11 @@ export interface Store {
    * update_id, or an edit of a message that already woke the bot, gets "duplicate".
    */
   claimMessage(chatId: string, messageId: number, now: number, ttlMs: number): Promise<"new" | "duplicate">;
+  /**
+   * Claim the inline keyboard on one bot message. The first accepted tap wins.
+   * A second tap, including a different button on the same message, is "duplicate".
+   */
+  claimCallback(chatId: string, messageId: number, now: number, ttlMs: number): Promise<"new" | "duplicate">;
   hitRate(
     bucketKey: string,
     now: number,
@@ -163,6 +168,7 @@ interface Bucket {
 export class MemoryStore implements Store {
   private readonly updates = new Map<number, number>();
   private readonly messages = new Map<string, number>();
+  private readonly callbacks = new Map<string, number>();
   private readonly buckets = new Map<string, Bucket>();
   private readonly contexts = new Map<string, ContextMessage[]>();
   private readonly typing = new Map<string, TypingScope>();
@@ -191,6 +197,17 @@ export class MemoryStore implements Store {
     const expiry = this.messages.get(key);
     if (expiry !== undefined && expiry > now) return "duplicate";
     this.messages.set(key, now + ttlMs);
+    return "new";
+  }
+
+  async claimCallback(chatId: string, messageId: number, now: number, ttlMs: number): Promise<"new" | "duplicate"> {
+    for (const [key, expiry] of this.callbacks) {
+      if (expiry <= now) this.callbacks.delete(key);
+    }
+    const key = `${chatId}:${messageId}`;
+    const expiry = this.callbacks.get(key);
+    if (expiry !== undefined && expiry > now) return "duplicate";
+    this.callbacks.set(key, now + ttlMs);
     return "new";
   }
 
