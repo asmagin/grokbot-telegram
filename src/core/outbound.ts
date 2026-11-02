@@ -541,7 +541,7 @@ export async function handleSendEdit(request: Request, deps: AppDeps): Promise<R
       deps.log({ event: "outbound_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
     });
   }
-  return succeedSend(deps, {
+  return await succeedSend(deps, {
     chatId,
     auth,
     final,

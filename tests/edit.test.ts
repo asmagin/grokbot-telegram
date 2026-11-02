@@ -393,7 +393,7 @@ describe("POST /send/edit", () => {
     expect(bridge.telegram("editMessageText").map((call) => (call.body as { text?: string }).text).at(-1)).toBe("Sunny all week.");
   });
 
-  it("drops a progress edit that was waiting when the final edit closed the wake", async () => {
+  it.each(["editMessageText", "setMessageReaction"])("drops a progress edit while finalization waits on %s", async (method) => {
     let releaseFinal: () => void = () => undefined;
     const finalGate = new Promise<void>((resolve) => {
       releaseFinal = resolve;
@@ -404,8 +404,9 @@ describe("POST /send/edit", () => {
     });
     const bridge = app({
       handler: (call) => {
-        if (!call.url.endsWith("/editMessageText")) return undefined;
-        if ((call.body as { text?: string }).text !== "Sunny all week.") return undefined;
+        if (!call.url.endsWith(`/${method}`)) return undefined;
+        if (method === "editMessageText" && (call.body as { text?: string }).text !== "Sunny all week.") return undefined;
+        if (method === "setMessageReaction" && (call.body as { reaction?: unknown[] }).reaction?.length !== 0) return undefined;
         markFinal();
         return finalGate.then(() => Response.json({ ok: true, result: { message_id: 1 } }));
       },
