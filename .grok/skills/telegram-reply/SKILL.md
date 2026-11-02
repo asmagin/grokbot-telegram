@@ -161,6 +161,7 @@ The person sees one answer per wake.
 | 403 `scope` | Chat or topic differs from the token's. | Send again with `reply.chat_id` and `reply.message_thread_id`. |
 | 403 `not_outbound` | That `message_id` is not a text message this wake sent through `/send`. | Use a `message_id` from this wake's `message_ids`. If you have none, send the answer as a new `"final": true` message. |
 | 409 `send_in_progress` or `previous_send_ambiguous` (`ambiguous: true`) | An earlier send with this final or key is in flight, or may already be posted. | Treat it as sent. If it was the final, call `reply.typing_stop_url` once. |
+| 409 `edit_in_progress` | Another edit of this same bubble is still running. | Retry this same edit once. Do not treat it as delivered. If the answer already landed, the retry returns 401 `wake_closed` or `already_sent`. Stop. |
 | 502 with `ambiguous: true` | Telegram may have posted it (timeout, reset, Telegram 5xx). | Treat it as sent. If it was the final, call `reply.typing_stop_url` once and stop. |
 | 502 with `ambiguous: false` | Telegram rejected the send. `sent_parts` is how many chunks went out. Typing, the 👀, and the token stay, even after a final. | Send only the rest, once, with `"final": true` if it was the answer. |
 | 502 with `edited: true` and `ambiguous: false` | The progress bubble was updated, then a later chunk failed. | Send that same final edit once more. The bridge skips chunks it already posted. Do not also send a new final. |

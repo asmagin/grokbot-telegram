@@ -334,6 +334,35 @@ async function rememberOutbound(deps: AppDeps, auth: OpenSend, messageIds: reado
   }
 }
 
+/** Longer than editMessageText plus its in-request 429 retries, so a live editor is not stolen. */
+const EDIT_LOCK_TTL_MS = 60_000;
+/** Stop waiting and leave the bubble alone. A Vercel invocation cannot sit here until the platform kills it. */
+const EDIT_LOCK_WAIT_MS = 30_000;
+const EDIT_LOCK_POLL_MS = 20;
+
+function editLockKey(wakeId: string, messageId: number): string {
+  return `${wakeId}:edit:${messageId}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * One edit of this message at a time, including Telegram's 429 retry inside
+ * editMessageText. Returns the owner token, or null when the wait runs out.
+ */
+async function acquireEditLock(deps: AppDeps, wakeId: string, messageId: number): Promise<string | null> {
+  const key = editLockKey(wakeId, messageId);
+  const started = Date.now();
+  for (;;) {
+    const token = await deps.store.claimEditLock(key, deps.now(), EDIT_LOCK_TTL_MS);
+    if (token) return token;
+    if (Date.now() - started >= EDIT_LOCK_WAIT_MS) return null;
+    await delay(EDIT_LOCK_POLL_MS);
+  }
+}
+
 interface EditBody {
   chat_id?: unknown;
   text?: unknown;
@@ -389,11 +418,22 @@ export async function handleSendEdit(request: Request, deps: AppDeps): Promise<R
   // A progress edit stays one bubble. Only the final answer may spill into new messages.
   if (!final && parts.length > 1) return json(413, { ok: false, error: "edit_too_long" });
 
+  // Held across the Telegram call. A progress edit delayed by a 429 retry must
+  // not run after a final edit of this same message, or it would replace the
+  // delivered answer and the final slot would refuse to write it back.
+  const lockToken = await acquireEditLock(deps, wakeId, messageId);
+  if (!lockToken) {
+    deps.log({ event: "edit_lock_timeout", chat_id: chatId, wake_id: wakeId });
+    return json(409, { ok: false, error: "edit_in_progress" });
+  }
+  try {
+  // Recheck inside the lock. `auth.closed` was read before we waited.
+  const closedNow = await deps.store.isWakeClosed(wakeId, deps.now());
+  if (!final && closedNow) return json(401, { ok: false, error: "wake_closed" });
   const reserved = final
-    ? await reserveSend(deps, auth, chatId, true, null)
+    ? await reserveSend(deps, { ...auth, closed: closedNow }, chatId, true, null)
     : { ok: true as const, sendKey: null, sendTtlMs: Math.max(1000, auth.expiresAtMs - deps.now()) };
   if (!reserved.ok) return reserved.response;
-  if (!final && auth.closed) return json(401, { ok: false, error: "wake_closed" });
 
   const first = parts[0] ?? "";
   const edited = await deps.telegram.editMessageText({ chat_id: chatId, message_id: messageId, text: first });
@@ -502,6 +542,11 @@ export async function handleSendEdit(request: Request, deps: AppDeps): Promise<R
     via: "edit",
     notModified: edited.notModified === true,
   });
+  } finally {
+    await deps.store.releaseEditLock(editLockKey(wakeId, messageId), lockToken).catch((err: unknown) => {
+      deps.log({ event: "edit_lock_release_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+    });
+  }
 }
 
 /** A repeat of a send we already own. Never sends again. */

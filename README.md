@@ -189,6 +189,8 @@ curl -sS -X POST "$EDIT_URL" \
 
 `$EDIT_URL` is `reply.edit_url`. `message_id` is one id from the earlier `/send` response. An answer longer than 4096 characters is split: the first piece replaces that message and the rest are new messages, which notify. A progress edit over 4096 characters is `413 {"error": "edit_too_long"}`. A final edit that fails after the first piece is updated returns `502` with `"edited": true`. Sending that same edit once more skips bubbles already posted. An edit does not notify by itself. Telegram has no notification flag on `editMessageText`.
 
+Edits of one message run one at a time, and the bridge checks again that the wake is still open after it gets that turn. A progress edit stuck in a Telegram rate-limit retry cannot replace an answer that already landed. The final slot stays closed, so that stale text is never written. If the other edit is still running after 30 seconds, `/send/edit` returns `409 {"ok": false, "error": "edit_in_progress"}` and leaves the bubble as it is.
+
 A photo or a document uses `reply.send_media_url` (`POST /send/media`) with the same token. `"final": true` on a photo or document is the answer, and it uses the same one-final slot as text. A caption is optional and at most 1024 characters.
 
 ```bash

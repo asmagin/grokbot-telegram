@@ -54,6 +54,8 @@ interface DoOp {
   record?: SendRecord;
   messageIds?: number[];
   tail?: EditTail | null;
+  lockKey?: string;
+  token?: string;
 }
 
 export async function handleDoFetch(
@@ -107,6 +109,10 @@ export async function handleDoFetch(
       return Response.json(await outboundTail(storage, body));
     case "outbound.tail.set":
       return Response.json(await outboundTailSet(storage, body));
+    case "edit.lock":
+      return Response.json(await editLock(storage, body));
+    case "edit.unlock":
+      return Response.json(await editUnlock(storage, body));
     default:
       return Response.json({ ok: false, error: "unknown_op" }, { status: 400 });
   }
@@ -403,6 +409,34 @@ async function outboundTail(storage: DoStorage, body: DoOp): Promise<{ tail: Edi
   if (typeof body.wakeId !== "string") return { tail: null };
   const current = await readOutbound(storage, body.wakeId, body.now ?? Date.now());
   return { tail: current?.tail ?? null };
+}
+
+interface StoredEditLock {
+  until: number;
+  token: string;
+}
+
+/** One editor at a time for a wake's message. The DO serializes the claim itself. */
+async function editLock(storage: DoStorage, body: DoOp): Promise<{ token: string | null }> {
+  if (!body.lockKey || typeof body.ttlMs !== "number") return { token: null };
+  const now = body.now ?? Date.now();
+  const key = `elock:${body.lockKey}`;
+  const existing = await storage.get<StoredEditLock>(key);
+  if (existing && typeof existing.until === "number" && existing.until > now && typeof existing.token === "string") {
+    return { token: null };
+  }
+  const token = crypto.randomUUID();
+  await storage.put<StoredEditLock>(key, { until: now + body.ttlMs, token });
+  await pruneExpired(storage, "elock:", now);
+  return { token };
+}
+
+async function editUnlock(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {
+  if (!body.lockKey || typeof body.token !== "string") return { ok: true };
+  const key = `elock:${body.lockKey}`;
+  const existing = await storage.get<StoredEditLock>(key);
+  if (existing && existing.token === body.token) await storage.delete(key);
+  return { ok: true };
 }
 
 async function outboundTailSet(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {

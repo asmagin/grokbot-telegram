@@ -111,6 +111,13 @@ export function createDurableBackend(namespace: DoNamespace): { store: Store; ty
     async setEditTail(wakeId, tail, now, ttlMs) {
       await call(namespace, "dedupe", { op: "outbound.tail.set", wakeId, tail, now, ttlMs });
     },
+    async claimEditLock(key, now, ttlMs) {
+      const result = await call(namespace, "dedupe", { op: "edit.lock", lockKey: key, now, ttlMs });
+      return typeof result.token === "string" ? result.token : null;
+    },
+    async releaseEditLock(key, token) {
+      await call(namespace, "dedupe", { op: "edit.unlock", lockKey: key, token });
+    },
   };
 
   // The chat's Durable Object owns typing state, the reaction, and the alarm, so they survive eviction.

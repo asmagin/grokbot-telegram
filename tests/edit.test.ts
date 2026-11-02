@@ -25,6 +25,7 @@ interface Reply {
 function app(options: {
   env?: Record<string, string>;
   handler?: (call: RecordedCall) => Response | Promise<Response> | undefined;
+  sleep?: (ms: number) => Promise<void>;
 } = {}) {
   const mock = createFetchMock(async (call) => {
     const custom = await options.handler?.(call);
@@ -36,7 +37,7 @@ function app(options: {
     env: options.env ?? testEnv(),
     fetchImpl: mock.fetchImpl,
     now: () => NOW,
-    sleep: async () => undefined,
+    sleep: options.sleep ?? (async () => undefined),
     waitUntil: (promise) => tasks.push(promise),
     typingMode: "once",
     log: (event) => logs.push(event),
@@ -333,6 +334,100 @@ describe("POST /send/edit", () => {
     const edited = await bridge.send(reply, { message_id: 90, text: "caption" }, "/send/edit");
     expect(edited.status).toBe(403);
     expect(bridge.telegram("editMessageText")).toHaveLength(0);
+  });
+
+  it("lets a rate-limited progress edit finish before the final edit, so the answer stays", async () => {
+    let progressAttempts = 0;
+    let releaseRetry: () => void = () => undefined;
+    const retryGate = new Promise<void>((resolve) => {
+      releaseRetry = resolve;
+    });
+    let markAsleep: () => void = () => undefined;
+    const asleep = new Promise<void>((resolve) => {
+      markAsleep = resolve;
+    });
+    const bridge = app({
+      sleep: async () => {
+        markAsleep();
+        await retryGate;
+      },
+      handler: (call) => {
+        if (!call.url.endsWith("/editMessageText")) return undefined;
+        const text = (call.body as { text?: string }).text;
+        if (text !== "Still working.") return undefined;
+        progressAttempts += 1;
+        if (progressAttempts === 1) {
+          return Response.json({
+            ok: false,
+            error_code: 429,
+            description: "Too Many Requests",
+            parameters: { retry_after: 1 },
+          }, { status: 429 });
+        }
+        return undefined;
+      },
+    });
+    await postUpdate(bridge.deps, bridge.tasks, dmUpdate("long job", 1));
+    const reply = bridge.replies()[0]!;
+    const progress = await bridge.send(reply, { text: "Pulling the numbers." });
+    const messageId = (await progress.json() as { message_ids: number[] }).message_ids[0]!;
+
+    const progressEdit = bridge.send(reply, { message_id: messageId, text: "Still working." }, "/send/edit");
+    await asleep;
+    const finalEdit = bridge.send(reply, { message_id: messageId, text: "Sunny all week.", final: true }, "/send/edit");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bridge.telegram("editMessageText").map((call) => (call.body as { text?: string }).text)).toEqual(["Still working."]);
+
+    releaseRetry();
+    const [progressResponse, finalResponse] = await Promise.all([progressEdit, finalEdit]);
+    expect(progressResponse.status).toBe(200);
+    expect(finalResponse.status).toBe(200);
+    expect(bridge.telegram("editMessageText").map((call) => (call.body as { text?: string }).text)).toEqual([
+      "Still working.",
+      "Still working.",
+      "Sunny all week.",
+    ]);
+    expect(await bridge.deps.store.getTyping(scopeKey("42", null))).toBeNull();
+    const again = await bridge.send(reply, { message_id: messageId, text: "Sunny all week.", final: true }, "/send/edit");
+    expect(await again.json()).toMatchObject({ already_sent: true });
+    expect(bridge.telegram("editMessageText").map((call) => (call.body as { text?: string }).text).at(-1)).toBe("Sunny all week.");
+  });
+
+  it("drops a progress edit that was waiting when the final edit closed the wake", async () => {
+    let releaseFinal: () => void = () => undefined;
+    const finalGate = new Promise<void>((resolve) => {
+      releaseFinal = resolve;
+    });
+    let markFinal: () => void = () => undefined;
+    const finalInside = new Promise<void>((resolve) => {
+      markFinal = resolve;
+    });
+    const bridge = app({
+      handler: (call) => {
+        if (!call.url.endsWith("/editMessageText")) return undefined;
+        if ((call.body as { text?: string }).text !== "Sunny all week.") return undefined;
+        markFinal();
+        return finalGate.then(() => Response.json({ ok: true, result: { message_id: 1 } }));
+      },
+    });
+    await postUpdate(bridge.deps, bridge.tasks, dmUpdate("long job", 1));
+    const reply = bridge.replies()[0]!;
+    const progress = await bridge.send(reply, { text: "Pulling the numbers." });
+    const messageId = (await progress.json() as { message_ids: number[] }).message_ids[0]!;
+
+    const finalEdit = bridge.send(reply, { message_id: messageId, text: "Sunny all week.", final: true }, "/send/edit");
+    await finalInside;
+    const progressEdit = bridge.send(reply, { message_id: messageId, text: "Still working." }, "/send/edit");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bridge.telegram("editMessageText").map((call) => (call.body as { text?: string }).text)).toEqual(["Sunny all week."]);
+
+    releaseFinal();
+    expect((await finalEdit).status).toBe(200);
+    const late = await progressEdit;
+    expect(late.status).toBe(401);
+    expect(await late.json()).toEqual({ ok: false, error: "wake_closed" });
+    expect(bridge.telegram("editMessageText").map((call) => (call.body as { text?: string }).text)).toEqual(["Sunny all week."]);
+    expect(await bridge.deps.store.getTyping(scopeKey("42", null))).toBeNull();
   });
 
   it("answers GET /send/edit with 405", async () => {

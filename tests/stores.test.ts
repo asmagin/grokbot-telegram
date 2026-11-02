@@ -89,6 +89,19 @@ describe("durable object dedupe storage", () => {
     expect([...(await storage.list({ prefix: "out:" })).keys()]).toEqual(["out:w2"]);
   });
 
+  it("locks one edit at a time and keeps a newer owner when an old token releases", async () => {
+    const storage = memoryStorage();
+    const first = await op(storage, { op: "edit.lock", lockKey: "w:edit:4", now: 1000, ttlMs: 100 });
+    expect(typeof first.token).toBe("string");
+    expect(await op(storage, { op: "edit.lock", lockKey: "w:edit:4", now: 1050, ttlMs: 100 })).toEqual({ token: null });
+    await op(storage, { op: "edit.unlock", lockKey: "w:edit:4", token: "not-the-owner" });
+    expect(await op(storage, { op: "edit.lock", lockKey: "w:edit:4", now: 1060, ttlMs: 100 })).toEqual({ token: null });
+    await op(storage, { op: "edit.unlock", lockKey: "w:edit:4", token: first.token });
+    const second = await op(storage, { op: "edit.lock", lockKey: "w:edit:4", now: 2000, ttlMs: 100 });
+    expect(typeof second.token).toBe("string");
+    expect(second.token).not.toBe(first.token);
+  });
+
   it("closes wakes per key with expiry", async () => {
     const storage = memoryStorage();
     await op(storage, { op: "wake.close", wakeId: "w1", now: 1000, ttlMs: 100 });
@@ -147,5 +160,24 @@ describe("memory store bounds", () => {
     expect(await store.getEditTail("w1", 1400)).toBeNull();
     expect(await store.ownsOutbound("w1", 4, 1400)).toBe(true);
     expect(await store.ownsOutbound("w1", 4, 2000)).toBe(false);
+  });
+
+  it("gives an edit lock to one caller and ignores a release from anyone else", async () => {
+    const store = new MemoryStore();
+    const first = await store.claimEditLock("w:edit:4", 1000, 100);
+    expect(typeof first).toBe("string");
+    expect(await store.claimEditLock("w:edit:4", 1050, 100)).toBeNull();
+    await store.releaseEditLock("w:edit:4", "not-the-owner");
+    expect(await store.claimEditLock("w:edit:4", 1060, 100)).toBeNull();
+    await store.releaseEditLock("w:edit:4", first ?? "");
+    const second = await store.claimEditLock("w:edit:4", 1070, 50);
+    expect(typeof second).toBe("string");
+    expect(second).not.toBe(first);
+    const third = await store.claimEditLock("w:edit:4", 1200, 50);
+    expect(typeof third).toBe("string");
+    await store.releaseEditLock("w:edit:4", second ?? "");
+    expect(await store.claimEditLock("w:edit:4", 1210, 50)).toBeNull();
+    await store.releaseEditLock("w:edit:4", third ?? "");
+    expect(await store.claimEditLock("w:edit:4", 1220, 50)).not.toBeNull();
   });
 });

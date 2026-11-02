@@ -46,6 +46,14 @@ export interface Store {
    */
   getEditTail(wakeId: string, now: number): Promise<EditTail | null>;
   setEditTail(wakeId: string, tail: EditTail | null, now: number, ttlMs: number): Promise<void>;
+  /**
+   * Exclusive lock for edits of one message. Returns an owner token when this
+   * caller holds it, or null when another edit still holds it. An expired lock
+   * can be taken. Release only with the same token, so a late release cannot
+   * drop a lock someone else has since acquired.
+   */
+  claimEditLock(key: string, now: number, ttlMs: number): Promise<string | null>;
+  releaseEditLock(key: string, token: string): Promise<void>;
 }
 
 /** Message ids already sent after an edited first chunk, when the rest of a final edit did not finish. */
@@ -161,6 +169,7 @@ export class MemoryStore implements Store {
   private readonly closedWakes = new Map<string, number>();
   private readonly sends = new Map<string, { until: number; record: SendRecord }>();
   private readonly outbound = new Map<string, { until: number; ids: number[]; tail: EditTail | null }>();
+  private readonly editLocks = new Map<string, { until: number; token: string }>();
 
   async claimUpdate(updateId: number, now: number, ttlMs: number): Promise<"new" | "duplicate"> {
     this.pruneUpdates(now);
@@ -284,6 +293,22 @@ export class MemoryStore implements Store {
 
   async getEditTail(wakeId: string, now: number): Promise<EditTail | null> {
     return this.liveOutbound(wakeId, now)?.tail ?? null;
+  }
+
+  async claimEditLock(key: string, now: number, ttlMs: number): Promise<string | null> {
+    for (const [other, entry] of this.editLocks) {
+      if (entry.until <= now) this.editLocks.delete(other);
+    }
+    const existing = this.editLocks.get(key);
+    if (existing && existing.until > now) return null;
+    const token = crypto.randomUUID();
+    this.editLocks.set(key, { until: now + ttlMs, token });
+    return token;
+  }
+
+  async releaseEditLock(key: string, token: string): Promise<void> {
+    const existing = this.editLocks.get(key);
+    if (existing && existing.token === token) this.editLocks.delete(key);
   }
 
   async setEditTail(wakeId: string, tail: EditTail | null, now: number, ttlMs: number): Promise<void> {

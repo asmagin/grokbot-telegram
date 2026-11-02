@@ -292,6 +292,7 @@ After an ambiguous result, treat the message as sent. A timeout, no response, or
 Repeat a final at most once. The bridge answers "already_sent": true if it was delivered. A final photo, a final text, and a final edit share that one slot.
 If /send, /send/edit, or /send/media returns 401, the token expired or this wake is finished. Stop. The person can message again.
 If a "final": true send or edit returns 502 with "ambiguous": false, typing stays up and the token still works. Send the same edit once more if "edited": true (the bridge skips bubbles it already posted). Otherwise send only the unsent part, once, after retry_after if it is given. Do not also send a second final.
+If /send/edit returns 409 edit_in_progress, another edit of that bubble is still running. Retry that same request once. Do not treat it as delivered. If the retry returns 401 wake_closed or already_sent, the answer already landed. Stop.
 A 2xx from this routine's own webhook means you woke up. The person sees what you send to reply.send_url, reply.edit_url, or reply.send_media_url.
 
 The answer goes to the person who wrote the Telegram message, in that Telegram chat and topic, through reply.send_url, reply.edit_url, or reply.send_media_url. Post in this Grok Bot chat only if sending fails, with one short line.
