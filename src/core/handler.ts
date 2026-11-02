@@ -3,7 +3,7 @@ import type { AppDeps } from "./deps.js";
 import { json, routePath } from "./http.js";
 import { handleGetFile } from "./files.js";
 import { handleWebhook } from "./inbound.js";
-import { handleSend, handleSendMedia, handleTypingHeartbeat, handleTypingStop } from "./outbound.js";
+import { handleSend, handleSendEdit, handleSendMedia, handleTypingHeartbeat, handleTypingStop } from "./outbound.js";
 
 export async function handleHealth(deps: AppDeps): Promise<Response> {
   const configured = configStatus(deps.config);
@@ -40,6 +40,7 @@ async function route(request: Request, deps: AppDeps): Promise<Response> {
   }
   if (request.method === "POST" && path === "/webhook") return handleWebhook(request, deps);
   if (request.method === "POST" && path === "/send") return handleSend(request, deps);
+  if (request.method === "POST" && path === "/send/edit") return handleSendEdit(request, deps);
   if (request.method === "POST" && path === "/send/media") return handleSendMedia(request, deps);
   if (request.method === "POST" && path === "/typing/stop") return handleTypingStop(request, deps);
   if (request.method === "POST" && path === "/typing/heartbeat") return handleTypingHeartbeat(request, deps);
@@ -54,10 +55,10 @@ async function route(request: Request, deps: AppDeps): Promise<Response> {
     if (!token || token.includes("/")) return json(404, { ok: false, error: "not_found" });
     return handleGetFile(request, deps, token);
   }
-  if (["/healthz", "/webhook", "/send", "/send/media", "/typing/stop", "/typing/heartbeat"].includes(path)) {
+  if (["/healthz", "/webhook", "/send", "/send/edit", "/send/media", "/typing/stop", "/typing/heartbeat"].includes(path)) {
     return json(405, { ok: false, error: "method_not_allowed" });
   }
   return json(404, { ok: false, error: "not_found" });
 }
 
-export { handleGetFile, handleSend, handleSendMedia, handleTypingHeartbeat, handleTypingStop, handleWebhook };
+export { handleGetFile, handleSend, handleSendEdit, handleSendMedia, handleTypingHeartbeat, handleTypingStop, handleWebhook };

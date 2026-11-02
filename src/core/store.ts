@@ -38,6 +38,56 @@ export interface Store {
   /** Drop a claim after a send that definitely did not go out, so it can be tried again. */
   releaseSend(key: string): Promise<void>;
   isWakeClosed(wakeId: string, now: number): Promise<boolean>;
+  /**
+   * Remember Telegram message ids this wake posted via `/send`, so `/send/edit`
+   * can refuse every other id. Kept for the reply token's remaining life.
+   */
+  noteOutbound(wakeId: string, messageIds: readonly number[], now: number, ttlMs: number): Promise<void>;
+  /** True when this wake posted `messageId` and the record has not expired. */
+  ownsOutbound(wakeId: string, messageId: number, now: number): Promise<boolean>;
+  /**
+   * Overflow bubbles already posted for a final edit of `messageId` that still
+   * has a tail to send. A retry of that edit skips these instead of duplicating them.
+   */
+  getEditTail(wakeId: string, now: number): Promise<EditTail | null>;
+  setEditTail(wakeId: string, tail: EditTail | null, now: number, ttlMs: number): Promise<void>;
+  /**
+   * Exclusive lock for edits of one message. Returns an owner token when this
+   * caller holds it, or null when another edit still holds it. An expired lock
+   * can be taken. Release only with the same token, so a late release cannot
+   * drop a lock someone else has since acquired.
+   */
+  claimEditLock(key: string, now: number, ttlMs: number): Promise<string | null>;
+  releaseEditLock(key: string, token: string): Promise<void>;
+}
+
+/** Message ids already sent after an edited first chunk, when the rest of a final edit did not finish. */
+export interface EditTail {
+  messageId: number;
+  overflowIds: number[];
+}
+
+/** Cap the allowlist so one busy wake cannot grow the record without bound. */
+export const MAX_OUTBOUND_IDS = 64;
+
+export function cleanMessageIds(ids: readonly unknown[]): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const id of ids) {
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0 || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out.length > MAX_OUTBOUND_IDS ? out.slice(out.length - MAX_OUTBOUND_IDS) : out;
+}
+
+export function normalizeEditTail(value: unknown): EditTail | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.messageId !== "number" || !Number.isSafeInteger(record.messageId) || record.messageId <= 0) {
+    return null;
+  }
+  return { messageId: record.messageId, overflowIds: cleanMessageIds(Array.isArray(record.overflowIds) ? record.overflowIds : []) };
 }
 
 /**
@@ -124,6 +174,8 @@ export class MemoryStore implements Store {
   private readonly typing = new Map<string, TypingScope>();
   private readonly closedWakes = new Map<string, number>();
   private readonly sends = new Map<string, { until: number; record: SendRecord }>();
+  private readonly outbound = new Map<string, { until: number; ids: number[]; tail: EditTail | null }>();
+  private readonly editLocks = new Map<string, { until: number; token: string }>();
 
   async claimUpdate(updateId: number, now: number, ttlMs: number): Promise<"new" | "duplicate"> {
     this.pruneUpdates(now);
@@ -241,6 +293,58 @@ export class MemoryStore implements Store {
 
   async releaseSend(key: string): Promise<void> {
     this.sends.delete(key);
+  }
+
+  async noteOutbound(wakeId: string, messageIds: readonly number[], now: number, ttlMs: number): Promise<void> {
+    const adding = cleanMessageIds(messageIds);
+    if (adding.length === 0) return;
+    const current = this.liveOutbound(wakeId, now);
+    const ids = cleanMessageIds([...(current?.ids ?? []), ...adding]);
+    this.outbound.set(wakeId, { until: now + ttlMs, ids, tail: current?.tail ?? null });
+  }
+
+  async ownsOutbound(wakeId: string, messageId: number, now: number): Promise<boolean> {
+    const current = this.liveOutbound(wakeId, now);
+    return current !== null && current.ids.includes(messageId);
+  }
+
+  async getEditTail(wakeId: string, now: number): Promise<EditTail | null> {
+    return this.liveOutbound(wakeId, now)?.tail ?? null;
+  }
+
+  async claimEditLock(key: string, now: number, ttlMs: number): Promise<string | null> {
+    for (const [other, entry] of this.editLocks) {
+      if (entry.until <= now) this.editLocks.delete(other);
+    }
+    const existing = this.editLocks.get(key);
+    if (existing && existing.until > now) return null;
+    const token = crypto.randomUUID();
+    this.editLocks.set(key, { until: now + ttlMs, token });
+    return token;
+  }
+
+  async releaseEditLock(key: string, token: string): Promise<void> {
+    const existing = this.editLocks.get(key);
+    if (existing && existing.token === token) this.editLocks.delete(key);
+  }
+
+  async setEditTail(wakeId: string, tail: EditTail | null, now: number, ttlMs: number): Promise<void> {
+    const current = this.liveOutbound(wakeId, now);
+    const normalized = tail ? normalizeEditTail(tail) : null;
+    if (!current && !normalized) return;
+    this.outbound.set(wakeId, {
+      until: now + ttlMs,
+      ids: current?.ids ?? [],
+      tail: normalized,
+    });
+  }
+
+  private liveOutbound(wakeId: string, now: number): { until: number; ids: number[]; tail: EditTail | null } | null {
+    for (const [key, entry] of this.outbound) {
+      if (entry.until <= now) this.outbound.delete(key);
+    }
+    const entry = this.outbound.get(wakeId);
+    return entry && entry.until > now ? entry : null;
   }
 
   private pruneUpdates(now: number): void {

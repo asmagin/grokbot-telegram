@@ -1,5 +1,5 @@
 import type { ContextMessage } from "../../core/types.js";
-import { chatIdFromRateKey, chatIdFromScope, normalizeSendRecord, type Store } from "../../core/store.js";
+import { chatIdFromRateKey, chatIdFromScope, normalizeEditTail, normalizeSendRecord, type Store } from "../../core/store.js";
 import { normalizeScope, type TypingController } from "../../core/typing.js";
 
 export interface DoId {
@@ -100,6 +100,27 @@ export function createDurableBackend(namespace: DoNamespace): { store: Store; ty
     },
     async releaseSend(key) {
       await call(namespace, "dedupe", { op: "send.release", sendKey: key });
+    },
+    async noteOutbound(wakeId, messageIds, now, ttlMs) {
+      await call(namespace, "dedupe", { op: "outbound.note", wakeId, messageIds: [...messageIds], now, ttlMs });
+    },
+    async ownsOutbound(wakeId, messageId, now) {
+      const result = await call(namespace, "dedupe", { op: "outbound.owns", wakeId, messageId, now });
+      return result.owns === true;
+    },
+    async getEditTail(wakeId, now) {
+      const result = await call(namespace, "dedupe", { op: "outbound.tail", wakeId, now });
+      return normalizeEditTail(result.tail);
+    },
+    async setEditTail(wakeId, tail, now, ttlMs) {
+      await call(namespace, "dedupe", { op: "outbound.tail.set", wakeId, tail, now, ttlMs });
+    },
+    async claimEditLock(key, now, ttlMs) {
+      const result = await call(namespace, "dedupe", { op: "edit.lock", lockKey: key, now, ttlMs });
+      return typeof result.token === "string" ? result.token : null;
+    },
+    async releaseEditLock(key, token) {
+      await call(namespace, "dedupe", { op: "edit.unlock", lockKey: key, token });
     },
   };
 

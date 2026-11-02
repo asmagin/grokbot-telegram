@@ -10,7 +10,14 @@ import {
 } from "../../core/typing.js";
 import { createTelegramClient } from "../../core/telegram.js";
 import { collectSecrets, createLogger } from "../../core/log.js";
-import { freshContext, normalizeSendRecord, type SendRecord } from "../../core/store.js";
+import {
+  cleanMessageIds,
+  freshContext,
+  normalizeEditTail,
+  normalizeSendRecord,
+  type EditTail,
+  type SendRecord,
+} from "../../core/store.js";
 import type { ContextMessage, TypingScope, TypingStart } from "../../core/types.js";
 
 export interface DoStorage {
@@ -45,6 +52,10 @@ interface DoOp {
   wakeId?: string | null;
   sendKey?: string;
   record?: SendRecord;
+  messageIds?: number[];
+  tail?: EditTail | null;
+  lockKey?: string;
+  token?: string;
 }
 
 export async function handleDoFetch(
@@ -92,6 +103,18 @@ export async function handleDoFetch(
     case "send.release":
       if (body.sendKey) await storage.delete(`send:${body.sendKey}`);
       return Response.json({ ok: true });
+    case "outbound.note":
+      return Response.json(await outboundNote(storage, body));
+    case "outbound.owns":
+      return Response.json(await outboundOwns(storage, body));
+    case "outbound.tail":
+      return Response.json(await outboundTail(storage, body));
+    case "outbound.tail.set":
+      return Response.json(await outboundTailSet(storage, body));
+    case "edit.lock":
+      return Response.json(await editLock(storage, body));
+    case "edit.unlock":
+      return Response.json(await editUnlock(storage, body));
     default:
       return Response.json({ ok: false, error: "unknown_op" }, { status: 400 });
   }
@@ -352,5 +375,101 @@ async function sendFinish(storage: DoStorage, body: DoOp): Promise<{ ok: true }>
   if (!body.sendKey || !record) return { ok: true };
   const now = body.now ?? Date.now();
   await storage.put<StoredSend>(`send:${body.sendKey}`, { until: now + (body.ttlMs ?? 3_600_000), record });
+  return { ok: true };
+}
+
+interface StoredOutbound {
+  until: number;
+  ids: number[];
+  tail: EditTail | null;
+}
+
+function outboundKey(wakeId: string): string {
+  return `out:${wakeId}`;
+}
+
+async function readOutbound(storage: DoStorage, wakeId: string, now: number): Promise<StoredOutbound | null> {
+  const existing = await storage.get<StoredOutbound>(outboundKey(wakeId));
+  if (!existing || typeof existing.until !== "number" || existing.until <= now) return null;
+  return {
+    until: existing.until,
+    ids: cleanMessageIds(Array.isArray(existing.ids) ? existing.ids : []),
+    tail: normalizeEditTail(existing.tail),
+  };
+}
+
+/** Serialized by the dedupe object, same as send claims. */
+async function outboundNote(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {
+  if (typeof body.wakeId !== "string" || !Array.isArray(body.messageIds)) return { ok: true };
+  const adding = cleanMessageIds(body.messageIds);
+  if (adding.length === 0) return { ok: true };
+  const now = body.now ?? Date.now();
+  const current = await readOutbound(storage, body.wakeId, now);
+  await storage.put<StoredOutbound>(outboundKey(body.wakeId), {
+    until: now + (body.ttlMs ?? 3_600_000),
+    ids: cleanMessageIds([...(current?.ids ?? []), ...adding]),
+    tail: current?.tail ?? null,
+  });
+  await pruneExpired(storage, "out:", now);
+  return { ok: true };
+}
+
+async function outboundOwns(storage: DoStorage, body: DoOp): Promise<{ owns: boolean }> {
+  if (typeof body.wakeId !== "string" || typeof body.messageId !== "number") return { owns: false };
+  const current = await readOutbound(storage, body.wakeId, body.now ?? Date.now());
+  return { owns: current !== null && current.ids.includes(body.messageId) };
+}
+
+async function outboundTail(storage: DoStorage, body: DoOp): Promise<{ tail: EditTail | null }> {
+  if (typeof body.wakeId !== "string") return { tail: null };
+  const current = await readOutbound(storage, body.wakeId, body.now ?? Date.now());
+  return { tail: current?.tail ?? null };
+}
+
+interface StoredEditLock {
+  until: number;
+  token: string;
+}
+
+/** One editor at a time for a wake's message. The DO serializes the claim itself. */
+async function editLock(storage: DoStorage, body: DoOp): Promise<{ token: string | null }> {
+  if (!body.lockKey || typeof body.ttlMs !== "number") return { token: null };
+  const now = body.now ?? Date.now();
+  const key = `elock:${body.lockKey}`;
+  const existing = await storage.get<StoredEditLock>(key);
+  if (existing && typeof existing.until === "number" && existing.until > now && typeof existing.token === "string") {
+    return { token: null };
+  }
+  const token = crypto.randomUUID();
+  await storage.put<StoredEditLock>(key, { until: now + body.ttlMs, token });
+  await pruneExpired(storage, "elock:", now);
+  return { token };
+}
+
+async function editUnlock(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {
+  if (!body.lockKey || typeof body.token !== "string") return { ok: true };
+  const key = `elock:${body.lockKey}`;
+  const existing = await storage.get<StoredEditLock>(key);
+  if (existing && existing.token === body.token) await storage.delete(key);
+  return { ok: true };
+}
+
+async function outboundTailSet(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {
+  if (typeof body.wakeId !== "string") return { ok: true };
+  const now = body.now ?? Date.now();
+  const key = outboundKey(body.wakeId);
+  const current = await readOutbound(storage, body.wakeId, now);
+  if (body.tail === null) {
+    if (!current) return { ok: true };
+    await storage.put<StoredOutbound>(key, { until: now + (body.ttlMs ?? 3_600_000), ids: current.ids, tail: null });
+    return { ok: true };
+  }
+  const tail = normalizeEditTail(body.tail);
+  if (!tail) return { ok: true };
+  await storage.put<StoredOutbound>(key, {
+    until: now + (body.ttlMs ?? 3_600_000),
+    ids: current?.ids ?? [],
+    tail,
+  });
   return { ok: true };
 }

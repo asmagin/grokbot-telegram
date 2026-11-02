@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:grokbot-telegram:wake-event:v3",
   "title": "Grok Bot Telegram wake event",
-  "description": "JSON body this bridge POSTs to a Grok Bot routine webhook. schema_version is 3. Version 3 adds message.attachments and reply.send_media_url. Every version 2 field is still present, so a consumer that only reads text can keep doing that. Version 2 added reply.heartbeat_url.",
+  "description": "JSON body this bridge POSTs to a Grok Bot routine webhook. schema_version is 3. Version 3 adds message.attachments, reply.send_media_url, and reply.edit_url. Every version 2 field is still present, so a consumer that only reads text can keep doing that. Version 2 added reply.heartbeat_url.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -89,13 +89,14 @@
     "reply": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["token", "expires_at", "wake_id", "send_url", "send_media_url", "typing_stop_url", "heartbeat_url", "chat_id", "message_thread_id"],
+      "required": ["token", "expires_at", "wake_id", "send_url", "send_media_url", "edit_url", "typing_stop_url", "heartbeat_url", "chat_id", "message_thread_id"],
       "properties": {
-        "token": { "type": "string", "description": "Bearer token for /send, /send/media, GET /file/<token>, /typing/stop, and /typing/heartbeat. Multi-use until final or expiry. Not sufficient to fetch a file unless the file URL was signed for this same wake." },
+        "token": { "type": "string", "description": "Bearer token for /send, /send/edit, /send/media, GET /file/<token>, /typing/stop, and /typing/heartbeat. Multi-use until final or expiry. Not sufficient to fetch a file unless the file URL was signed for this same wake." },
         "expires_at": { "type": "string", "format": "date-time" },
         "wake_id": { "type": "string" },
-        "send_url": { "type": "string", "description": "POST a text reply here. final: true on the last message ends typing and the reaction after Telegram accepts it; earlier messages are silent by default and renew the lease." },
+        "send_url": { "type": "string", "description": "POST a text reply here. The 200 body includes message_ids, the Telegram ids created. final: true on the last message ends typing and the reaction after Telegram accepts it; earlier messages are silent by default and renew the lease. Pass one of those ids to edit_url to update that bubble in place." },
         "send_media_url": { "type": "string", "description": "POST a photo or document here. Same token, chat, topic, reply_to, idempotency, and final semantics as send_url. JSON with an https url, or multipart upload under MAX_MEDIA_BYTES." },
+        "edit_url": { "type": "string", "description": "POST here to replace the text of a message this wake already sent through send_url. Body includes message_id from that send's message_ids. The bridge allows only those ids. final: true uses the same one-final slot as send_url and ends typing and the reaction. A final answer longer than 4096 characters is split: the first part replaces this message and the rest are new messages. Telegram's 'message is not modified' is success." },
         "typing_stop_url": { "type": "string", "description": "Fallback: end this wake's typing and reaction without sending text. Other wakes are unaffected." },
         "heartbeat_url": { "type": "string", "description": "Renew this wake's typing lease without sending text. Never extends past the ceiling or the token expiry." },
         "chat_id": { "type": "string" },

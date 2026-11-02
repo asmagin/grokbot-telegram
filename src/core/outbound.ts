@@ -82,7 +82,7 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
     // A split reply is several bubbles. The keyboard belongs on the last one.
     if (keyboard.markup && index === parts.length - 1) input.reply_markup = keyboard.markup;
     const sent = await deps.telegram.sendMessage(input);
-    if (!sent.ok) return failSend(deps, { chatId, auth, scope, reserved, messageIds, sent });
+    if (!sent.ok) return failSend(deps, { chatId, auth, scope, reserved, messageIds, sent, remember: true });
     messageIds.push(sent.messageId);
   }
   return succeedSend(deps, {
@@ -95,6 +95,7 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
     messageIds,
     parts: parts.length,
     silent,
+    remember: true,
   });
 }
 
@@ -155,7 +156,7 @@ export async function handleSendMedia(request: Request, deps: AppDeps): Promise<
   else input.file = media.source.file;
 
   const sent = await deps.telegram.sendMedia(input);
-  if (!sent.ok) return failSend(deps, { chatId: media.chatId, auth, scope, reserved, messageIds: [], sent });
+  if (!sent.ok) return failSend(deps, { chatId: media.chatId, auth, scope, reserved, messageIds: [], sent, remember: false });
   return succeedSend(deps, {
     chatId: media.chatId,
     auth,
@@ -167,6 +168,7 @@ export async function handleSendMedia(request: Request, deps: AppDeps): Promise<
     parts: 1,
     silent,
     kind: media.kind,
+    remember: false,
   });
 }
 
@@ -211,12 +213,20 @@ async function failSend(
     reserved: ReservedSend;
     messageIds: number[];
     sent: Extract<SendMessageResult, { ok: false }>;
+    remember: boolean;
+    /** Set when the failure is an editMessageText call rather than a new send. */
+    edit?: boolean;
+    /** The edit itself landed (or was already the requested text) before a later send failed. */
+    edited?: boolean;
   },
 ): Promise<Response> {
   const { chatId, auth, scope, reserved, messageIds, sent } = options;
+  if (options.remember) await rememberOutbound(deps, auth, messageIds);
   const ambiguous = sent.ambiguous === true;
   deps.log({
-    event: ambiguous ? "send_ambiguous" : "send_failed",
+    event: ambiguous
+      ? (options.edit ? "edit_ambiguous" : "send_ambiguous")
+      : (options.edit ? "edit_failed" : "send_failed"),
     chat_id: chatId,
     status: sent.status,
     sent_parts: messageIds.length,
@@ -235,13 +245,17 @@ async function failSend(
   }
   // Typing stays on: the answer did not get through. Anything that did clear typing on the clients.
   if (messageIds.length > 0) await afterMessage(deps, scope, auth.wakeId);
+  const editCall = options.edit === true;
   return json(502, {
     ok: false,
-    error: ambiguous ? "telegram_send_ambiguous" : "telegram_send_failed",
+    error: ambiguous
+      ? (editCall ? "telegram_edit_ambiguous" : "telegram_send_ambiguous")
+      : (editCall ? "telegram_edit_failed" : "telegram_send_failed"),
     ambiguous,
     description: sent.description,
     sent_parts: messageIds.length,
     message_ids: messageIds,
+    ...(options.edited !== undefined ? { edited: options.edited } : {}),
     ...(sent.retryAfter !== undefined ? { retry_after: sent.retryAfter } : {}),
   });
 }
@@ -259,6 +273,10 @@ async function succeedSend(
     parts: number;
     silent: boolean;
     kind?: string;
+    remember: boolean;
+    /** Log `edit` when the delivery was an in-place update. Defaults to a new send. */
+    via?: "send" | "edit";
+    notModified?: boolean;
   },
 ): Promise<Response> {
   const { chatId, auth, final, requestedWakeId, scope, reserved, messageIds, silent } = options;
@@ -271,6 +289,7 @@ async function succeedSend(
       deps.log({ event: "send_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
     }
   }
+  if (options.remember) await rememberOutbound(deps, auth, messageIds);
 
   const wakeId = auth.wakeId ?? (final ? requestedWakeId : null);
   if (final && wakeId) {
@@ -295,15 +314,252 @@ async function succeedSend(
   }
 
   deps.log({
-    event: "send",
+    event: options.via === "edit" ? "edit" : "send",
     chat_id: chatId,
     parts: options.parts,
     final,
     silent,
     wake_id: auth.wakeId,
     ...(options.kind ? { kind: options.kind } : {}),
+    ...(options.notModified ? { not_modified: true } : {}),
   });
-  return json(200, { ok: true, message_ids: messageIds });
+  return json(200, {
+    ok: true,
+    message_ids: messageIds,
+    ...(options.notModified ? { not_modified: true } : {}),
+  });
+}
+
+/**
+ * Message ids this wake may later edit. Photos and documents are left out:
+ * editMessageText only replaces text. A failed record is logged and the send
+ * still counts as delivered; the edit then fails closed with not_outbound.
+ */
+async function rememberOutbound(deps: AppDeps, auth: OpenSend, messageIds: readonly number[]): Promise<void> {
+  if (!auth.wakeId) return;
+  const ids = messageIds.filter((id) => Number.isSafeInteger(id) && id > 0);
+  if (ids.length === 0) return;
+  const ttlMs = Math.max(1000, auth.expiresAtMs - deps.now());
+  try {
+    await deps.store.noteOutbound(auth.wakeId, ids, deps.now(), ttlMs);
+  } catch (err) {
+    deps.log({ event: "outbound_record_failed", wake_id: auth.wakeId, error: err instanceof Error ? err.name : "error" });
+  }
+}
+
+/** Longer than editMessageText plus its in-request 429 retries, so a live editor is not stolen. */
+const EDIT_LOCK_TTL_MS = 60_000;
+/** Stop waiting and leave the bubble alone. A Vercel invocation cannot sit here until the platform kills it. */
+const EDIT_LOCK_WAIT_MS = 30_000;
+const EDIT_LOCK_POLL_MS = 20;
+
+function editLockKey(wakeId: string, messageId: number): string {
+  return `${wakeId}:edit:${messageId}`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * One edit of this message at a time, including Telegram's 429 retry inside
+ * editMessageText. Returns the owner token, or null when the wait runs out.
+ */
+async function acquireEditLock(deps: AppDeps, wakeId: string, messageId: number): Promise<string | null> {
+  const key = editLockKey(wakeId, messageId);
+  const started = Date.now();
+  for (;;) {
+    const token = await deps.store.claimEditLock(key, deps.now(), EDIT_LOCK_TTL_MS);
+    if (token) return token;
+    if (Date.now() - started >= EDIT_LOCK_WAIT_MS) return null;
+    await delay(EDIT_LOCK_POLL_MS);
+  }
+}
+
+interface EditBody {
+  chat_id?: unknown;
+  text?: unknown;
+  message_id?: unknown;
+  message_thread_id?: unknown;
+  final?: unknown;
+}
+
+/**
+ * Replace the text of a message this wake already sent. The reply token is
+ * the caller. The message id has to be one `/send` recorded for this wake;
+ * that check is the bridge's, not the caller's. `"final": true` takes the
+ * same one-final slot as `/send` and `/send/media`, then clears typing and
+ * the progress reaction. A longer final answer is split: the first piece
+ * replaces this message and the rest are new messages.
+ */
+export async function handleSendEdit(request: Request, deps: AppDeps): Promise<Response> {
+  const credential = await authenticate(request, deps);
+  if (!credential.ok) return credential.response;
+  const parsed = await readJson(request, deps.config.maxBodyBytes);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value as EditBody;
+  const chatId = normalizeId(body.chat_id);
+  const text = typeof body.text === "string" ? body.text : "";
+  const threadId = normalizeOptionalInt(body.message_thread_id);
+  const messageId = normalizeOptionalInt(body.message_id);
+  const final = body.final === true;
+  if (!chatId) return json(400, { ok: false, error: "bad_chat_id" });
+  if (!text.trim()) return json(400, { ok: false, error: "empty_text" });
+  if (text.length > MAX_TEXT_CHARS) return json(413, { ok: false, error: "text_too_large" });
+  if (threadId === "invalid" || messageId === "invalid" || messageId === null || messageId <= 0) {
+    return json(400, { ok: false, error: "bad_message_id" });
+  }
+
+  const auth = await authorize(credential, deps, chatId, threadId, { allowClosed: true });
+  if (!auth.ok) return auth.response;
+  if (!auth.wakeId) return json(400, { ok: false, error: "wake_id_required" });
+  const wakeId = auth.wakeId;
+  const scope = scopeKey(chatId, typeof threadId === "number" ? threadId : null);
+  let owned = false;
+  try {
+    owned = await deps.store.ownsOutbound(wakeId, messageId, deps.now());
+  } catch (err) {
+    deps.log({ event: "outbound_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+    return json(500, { ok: false, error: "internal_error" });
+  }
+  if (!owned) {
+    deps.log({ event: "edit_denied", chat_id: chatId, wake_id: wakeId });
+    return json(403, { ok: false, error: "not_outbound" });
+  }
+
+  const parts = splitTelegramText(text);
+  // A progress edit stays one bubble. Only the final answer may spill into new messages.
+  if (!final && parts.length > 1) return json(413, { ok: false, error: "edit_too_long" });
+
+  // Held across the Telegram call. A progress edit delayed by a 429 retry must
+  // not run after a final edit of this same message, or it would replace the
+  // delivered answer and the final slot would refuse to write it back.
+  const lockToken = await acquireEditLock(deps, wakeId, messageId);
+  if (!lockToken) {
+    deps.log({ event: "edit_lock_timeout", chat_id: chatId, wake_id: wakeId });
+    return json(409, { ok: false, error: "edit_in_progress" });
+  }
+  try {
+  // Recheck inside the lock. `auth.closed` was read before we waited.
+  const closedNow = await deps.store.isWakeClosed(wakeId, deps.now());
+  if (!final && closedNow) return json(401, { ok: false, error: "wake_closed" });
+  const reserved = final
+    ? await reserveSend(deps, { ...auth, closed: closedNow }, chatId, true, null)
+    : { ok: true as const, sendKey: null, sendTtlMs: Math.max(1000, auth.expiresAtMs - deps.now()) };
+  if (!reserved.ok) return reserved.response;
+
+  const first = parts[0] ?? "";
+  const edited = await deps.telegram.editMessageText({ chat_id: chatId, message_id: messageId, text: first });
+  if (!edited.ok) {
+    return failSend(deps, {
+      chatId,
+      auth,
+      scope,
+      reserved,
+      messageIds: [],
+      sent: edited,
+      remember: false,
+      edit: true,
+      edited: false,
+    });
+  }
+
+  // A final that had to be split may be retried. Skip overflow bubbles already posted
+  // when Telegram reports the first piece is unchanged. A different first piece drops
+  // that checkpoint (those bubbles are already in the chat).
+  let resume: number[] = [];
+  let hadTail = false;
+  if (final) {
+    let prior: { messageId: number; overflowIds: number[] } | null;
+    try {
+      prior = await deps.store.getEditTail(wakeId, deps.now());
+    } catch (err) {
+      deps.log({ event: "outbound_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+      if (reserved.sendKey) {
+        await deps.store.releaseSend(reserved.sendKey).catch(() => undefined);
+      }
+      return json(502, {
+        ok: false,
+        error: "telegram_edit_failed",
+        ambiguous: false,
+        edited: true,
+        description: "outbound_record_failed",
+        sent_parts: 1,
+        message_ids: [messageId],
+      });
+    }
+    const sameTail = edited.notModified === true && prior?.messageId === messageId;
+    if (prior && sameTail) resume = prior.overflowIds;
+    hadTail = prior !== null && sameTail;
+    if (prior && !sameTail) {
+      deps.log({ event: "edit_tail_reset", chat_id: chatId, wake_id: wakeId });
+      await deps.store.setEditTail(wakeId, null, deps.now(), reserved.sendTtlMs).catch((err: unknown) => {
+        deps.log({ event: "outbound_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+      });
+    }
+  }
+
+  const pending = parts.slice(1 + resume.length);
+  const messageIds = [messageId, ...resume];
+  for (const part of pending) {
+    const input: {
+      chat_id: string;
+      text: string;
+      message_thread_id?: number;
+      disable_notification?: boolean;
+    } = { chat_id: chatId, text: part, disable_notification: false };
+    if (typeof threadId === "number") input.message_thread_id = threadId;
+    const sent = await deps.telegram.sendMessage(input);
+    if (!sent.ok) {
+      const definite = sent.ambiguous !== true;
+      if (definite && messageIds.length > 1) {
+        await deps.store.setEditTail(
+          wakeId,
+          { messageId, overflowIds: messageIds.slice(1) },
+          deps.now(),
+          reserved.sendTtlMs,
+        ).catch((err: unknown) => {
+          deps.log({ event: "outbound_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+        });
+      }
+      return failSend(deps, {
+        chatId,
+        auth,
+        scope,
+        reserved,
+        messageIds,
+        sent,
+        remember: true,
+        edited: true,
+      });
+    }
+    messageIds.push(sent.messageId);
+  }
+
+  if (hadTail) {
+    await deps.store.setEditTail(wakeId, null, deps.now(), reserved.sendTtlMs).catch((err: unknown) => {
+      deps.log({ event: "outbound_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+    });
+  }
+  return await succeedSend(deps, {
+    chatId,
+    auth,
+    final,
+    requestedWakeId: null,
+    scope,
+    reserved,
+    messageIds,
+    parts: parts.length,
+    silent: !final,
+    remember: true,
+    via: "edit",
+    notModified: edited.notModified === true,
+  });
+  } finally {
+    await deps.store.releaseEditLock(editLockKey(wakeId, messageId), lockToken).catch((err: unknown) => {
+      deps.log({ event: "edit_lock_release_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+    });
+  }
 }
 
 /** A repeat of a send we already own. Never sends again. */
