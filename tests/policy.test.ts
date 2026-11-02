@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isAllowlisted, isOutboundChatAllowed } from "../src/core/allowlist.js";
-import { classifyAddress } from "../src/core/address.js";
+import { classifyAddress, transcriptAddressesBot } from "../src/core/address.js";
 import { loadConfig, parseIdList } from "../src/core/config.js";
 import { setMyCommandsBody, setWebhookBody } from "../src/core/commands.js";
 import { fastGreetingReply, splitTelegramText, truncateText } from "../src/core/text.js";
@@ -121,6 +121,19 @@ describe("group wake rules", () => {
         from: { id: 5, is_bot: false, username: "sam" },
       },
     }), config).addressed).toBe(false);
+  });
+});
+
+describe("spoken username", () => {
+  it("matches the username as a whole word, with or without @", () => {
+    expect(transcriptAddressesBot("hey testbot", "testbot")).toBe(true);
+    expect(transcriptAddressesBot("@testbot what time is it", "testbot")).toBe(true);
+    expect(transcriptAddressesBot("Hey TestBot,", "@testbot")).toBe(true);
+    expect(transcriptAddressesBot("nottestbot", "testbot")).toBe(false);
+    expect(transcriptAddressesBot("testbot2", "testbot")).toBe(false);
+    expect(transcriptAddressesBot("see contestbot", "testbot")).toBe(false);
+    expect(transcriptAddressesBot("hey bot", "bot")).toBe(false);
+    expect(transcriptAddressesBot("", "testbot")).toBe(false);
   });
 });
 

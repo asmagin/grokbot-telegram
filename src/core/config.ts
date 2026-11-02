@@ -46,9 +46,29 @@ export interface Config {
    */
   forwardBurstMs: number;
   allowInsecureWebhook: boolean;
+  /**
+   * Inbound speech-to-text. Null when `OPENAI_API_KEY` is unset, which leaves
+   * wake attachments exactly as they are without transcription.
+   */
+  speech: SpeechConfig | null;
   /** Names of settings that were present but rejected. Never contains values. */
   problems: string[];
 }
+
+/** OpenAI transcription, used only after the operator sets a key and the clip fits these caps. */
+export interface SpeechConfig {
+  apiKey: string;
+  /** Inclusive maximum of the Telegram duration field, in seconds. */
+  maxSeconds: number;
+  /** Inclusive maximum file size, in bytes. */
+  maxBytes: number;
+}
+
+export const MIN_OPENAI_KEY_LENGTH = 20;
+export const DEFAULT_TRANSCRIBE_MAX_SECONDS = 60;
+export const DEFAULT_TRANSCRIBE_MAX_BYTES = 2_000_000;
+export const MAX_TRANSCRIBE_SECONDS = 180;
+export const MAX_TRANSCRIBE_BYTES = 4_000_000;
 
 /** Reply-token signing key. Tokens can be brute-forced offline, so require real entropy. */
 export const MIN_REPLY_SECRET_LENGTH = 32;
@@ -202,6 +222,7 @@ export function loadConfig(env: EnvSource): Config {
   const typingMaxMs = readBoundedInt(env, "TYPING_MAX_MS", 1_800_000, 60_000, 7_200_000);
   const typingLeaseMs = Math.min(typingMaxMs, readBoundedInt(env, "TYPING_LEASE_MS", 600_000, 60_000, 3_600_000));
   const progressReaction = parseReaction(readString(env, "PROGRESS_REACTION"), problems);
+  const speech = loadSpeech(env, problems);
   return {
     telegramBotToken: readString(env, "TELEGRAM_BOT_TOKEN"),
     telegramWebhookSecret: isValidWebhookSecret(webhookSecret) ? webhookSecret : "",
@@ -234,7 +255,28 @@ export function loadConfig(env: EnvSource): Config {
     dedupeTtlMs: Math.max(1000, readInt(env, "DEDUPE_TTL_MS", 86_400_000)),
     forwardBurstMs: readBoundedInt(env, "FORWARD_BURST_MS", 1500, 0, 5000),
     allowInsecureWebhook,
+    speech,
     problems,
+  };
+}
+
+/**
+ * Transcription is off unless an API key is set. A key that is present but
+ * too short is rejected and reported by name. Duration and size caps apply
+ * only after the key is accepted; unset caps use the defaults.
+ */
+function loadSpeech(env: EnvSource, problems: string[]): SpeechConfig | null {
+  const apiKey = readString(env, "OPENAI_API_KEY");
+  if (!apiKey) return null;
+  if (apiKey.length < MIN_OPENAI_KEY_LENGTH) {
+    problems.push("OPENAI_API_KEY");
+    return null;
+  }
+  const maxBytes = readInt(env, "TRANSCRIBE_MAX_BYTES", DEFAULT_TRANSCRIBE_MAX_BYTES);
+  return {
+    apiKey,
+    maxSeconds: readBoundedInt(env, "TRANSCRIBE_MAX_SECONDS", DEFAULT_TRANSCRIBE_MAX_SECONDS, 1, MAX_TRANSCRIBE_SECONDS),
+    maxBytes: Math.min(MAX_TRANSCRIBE_BYTES, Math.max(1024, maxBytes)),
   };
 }
 

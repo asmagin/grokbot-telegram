@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { encodeWakeBody } from "../src/core/grok.js";
 import { cleanLabel, cleanText, truncateText } from "../src/core/text.js";
-import { SCHEMA_VERSION, type WakeEvent } from "../src/core/types.js";
+import { SCHEMA_VERSION, TRANSCRIPT_ERRORS, type WakeEvent } from "../src/core/types.js";
 import { createTestApp, dmUpdate, groupUpdate, postUpdate } from "./helpers.js";
 
 describe("untrusted content in the wake", () => {
@@ -63,5 +63,23 @@ describe("wake schema file", () => {
     const messageRequired = (schema.properties as { message?: { required?: string[] } }).message?.required ?? [];
     expect(Object.keys(payload.message).sort()).toEqual([...messageRequired].sort());
     expect(payload.callback).toBeNull();
+  });
+
+  it("keeps transcript fields optional on version 3", () => {
+    const schema = JSON.parse(readFileSync(new URL(`../schema/wake-event.v${SCHEMA_VERSION}.json`, import.meta.url), "utf8")) as {
+      $defs: {
+        attachment: {
+          required: string[];
+          properties: Record<string, { enum?: unknown[]; maxLength?: number }>;
+        };
+      };
+    };
+    const attachment = schema.$defs.attachment;
+    expect(attachment.required).not.toContain("transcript");
+    expect(attachment.required).not.toContain("transcript_language");
+    expect(attachment.required).not.toContain("transcript_error");
+    expect(attachment.properties.transcript?.maxLength).toBe(4000);
+    expect(attachment.properties.transcript_language?.maxLength).toBe(32);
+    expect(attachment.properties.transcript_error?.enum).toEqual([...TRANSCRIPT_ERRORS, null]);
   });
 });

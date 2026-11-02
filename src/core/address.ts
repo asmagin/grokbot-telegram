@@ -61,6 +61,20 @@ export function parseCommand(
   return { name, target, forThisBot };
 }
 
+/**
+ * Spoken stand-in for an @mention. A voice note or video note cannot carry a
+ * mention entity. The transcript counts only when it contains this bot's
+ * username as a whole word, with or without a leading @. A display name is
+ * not matched: the bridge does not know one, and a common first name would
+ * wake on ordinary speech. Usernames shorter than five characters are ignored.
+ */
+export function transcriptAddressesBot(text: string, botUsername: string): boolean {
+  const username = botUsername.trim().replace(/^@/, "");
+  if (!/^[A-Za-z0-9_]{5,32}$/.test(username)) return false;
+  const pattern = new RegExp(`(?:^|[^A-Za-z0-9_])@?${escapeRegExp(username)}(?![A-Za-z0-9_])`, "i");
+  return pattern.test(text);
+}
+
 export function mentionsBot(
   text: string,
   entities: readonly TelegramEntity[],

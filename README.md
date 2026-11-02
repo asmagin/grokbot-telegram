@@ -191,7 +191,7 @@ curl -sS -X POST "$EDIT_URL" \
 
 Edits of one message run one at a time, and the bridge checks again that the wake is still open after it gets that turn. A progress edit stuck in a Telegram rate-limit retry cannot replace an answer that already landed. The final slot stays closed, so that stale text is never written. If the other edit is still running after 30 seconds, `/send/edit` returns `409 {"ok": false, "error": "edit_in_progress"}` and leaves the bubble as it is.
 
-A photo or a document uses `reply.send_media_url` (`POST /send/media`) with the same token. `"final": true` on a photo or document is the answer, and it uses the same one-final slot as text. A caption is optional and at most 1024 characters.
+A photo, document, voice note, or audio file uses `reply.send_media_url` (`POST /send/media`) with the same token. `"final": true` on any of those is the answer, and it uses the same one-final slot as text. A caption is optional and at most 1024 characters.
 
 ```bash
 curl -sS -X POST "$SEND_MEDIA_URL" \
@@ -200,7 +200,16 @@ curl -sS -X POST "$SEND_MEDIA_URL" \
   -d '{"chat_id":"123","kind":"photo","url":"https://cdn.example/plot.png","caption":"Last week","reply_to_message_id":10,"final":true}'
 ```
 
-`kind` is `photo` or `document`. `url` must be `https`, with a hostname, and no username or password. The bridge does not download it. Telegram does. That keeps the request small on Vercel, whose platform body limit is about 4.5 MB. Telegram's own limits apply: photos about 10 MB, documents about 50 MB.
+`kind` is `photo`, `document`, `voice`, or `audio`. `url` must be `https`, with a hostname, and no username or password. The bridge does not download it. Telegram does. That keeps the request small on Vercel, whose platform body limit is about 4.5 MB. Telegram's own limits apply: photos about 10 MB, documents about 50 MB, voice notes about 20 MB, and other audio about 50 MB.
+
+`voice` is a voice note. Telegram `sendVoice` plays it as a voice message, which requires OGG with Opus. A URL is not inspected; Telegram rejects anything else. An upload must be `audio/ogg`, `audio/opus`, `application/ogg`, or a file with no content type. Anything else is `400 {"ok": false, "error": "bad_voice"}`. The bridge sends that upload as `audio/ogg` with an `.ogg` name. `audio` is any other sound file, sent with Telegram `sendAudio`. A voice note and an audio file share the one-final slot with text and photos.
+
+```bash
+curl -sS -X POST "$SEND_MEDIA_URL" \
+  -H "Authorization: Bearer $REPLY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id":"123","kind":"voice","url":"https://cdn.example/note.ogg","caption":"On my way","reply_to_message_id":10,"final":true}'
+```
 
 A small file can be uploaded instead, as `multipart/form-data`. The file field is `file`. The other fields are text, and `final` is the string `true` or `false`. The whole request must fit in `MAX_MEDIA_BYTES` (default 4,000,000, hard cap 4,194,304).
 
@@ -237,7 +246,7 @@ On Vercel and Node the one-tap claim lives in that process's memory, same as oth
 
 `/send`, `/send/edit`, and `/send/media` share one final slot per wake:
 
-- **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. A final photo, a final text, and a final edit are the same slot. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
+- **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. A final photo, document, voice note, audio file, text, and edit are the same slot. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
 - **`idempotency_key` on progress lines.** Use 1 to 128 characters from `A-Z a-z 0-9 . _ : -`. A repeat of a delivered key returns `already_sent`. Operator sends with `OUTBOUND_API_KEY` accept a key too.
 - **An ambiguous send counts as sent.** The bridge retries a Telegram send only on HTTP 429. After a timeout, a reset, a 5xx, or an unreadable 200, it returns `502 {"ok": false, "ambiguous": true, "error": "telegram_send_ambiguous"}`. A repeat of that final or key returns `409 {"ambiguous": true, "error": "previous_send_ambiguous"}`. A definite failure (`"ambiguous": false`) frees the final or key, so the missing part can go out once.
 
@@ -246,6 +255,22 @@ On Vercel and Node the one-tap claim lives in that process's memory, same as oth
 A photo, document, video, animation, audio, voice message, video note, or sticker arrives as `message.attachments`. The caption is `message.text`. `message.media` is still the list of kind names, including kinds that are not files (`contact`, `location`, `poll`).
 
 Each attachment has `kind`, `mime_type`, `file_name`, `file_size`, `width`, `height`, `duration`, `file_url`, and `unavailable`. For a photo, the bridge picks the largest size. The file id stays inside a signed token. The bot token is not in the payload.
+
+### Transcripts
+
+Set `OPENAI_API_KEY` to turn on speech-to-text. Leave it unset and attachments stay exactly as they are today: no `transcript` field. The bridge then sends voice notes, audio, and video notes that fit `TRANSCRIBE_MAX_SECONDS` (default 60, clamped to 1–180) and `TRANSCRIBE_MAX_BYTES` (default 2000000, clamped to 1024–4000000) to OpenAI's transcription API (`gpt-transcribe`, one HTTPS multipart POST to `https://api.openai.com/v1/audio/transcriptions`). That call fits a Vercel function: there is no local model and no ffmpeg. The function's `maxDuration` is 60 seconds, and the bridge stops the whole transcription pass at 35 seconds so the webhook can still answer Telegram.
+
+On those three kinds the attachment gains three fields:
+
+| Field | Meaning |
+| --- | --- |
+| `transcript` | Untrusted text, cleaned and capped at 4000 characters like `message.text`. Null when there is no text. |
+| `transcript_language` | The provider's language when it reported one (`en`, or a name such as `english`). Null when it did not. The first language is kept when it reports more than one. |
+| `transcript_error` | Null when `transcript` is text. Otherwise `too_long`, `too_large`, `unavailable`, `fetch_failed`, `provider_error`, `timeout`, `empty`, or `unsupported`. |
+
+`message.text` stays the caption, which is empty for a voice note or a video note. The words are on `transcript`, not copied into `message.text` or into `short_term`. A later wake does not replay the transcript. A failure does not drop a wake that was already addressed: the file URL is still there, `transcript` is null, and `transcript_error` says why. A group voice note whose transcript fails is not a mention, so it does not wake the bot. Over the duration or size cap, the bridge does not download the file and does not call OpenAI. Types OpenAI does not take (for example `audio/aac` with no recognized extension) are `unsupported`. The key is redacted in logs. Logs record the kind, the byte size, the duration, and the reason, never the transcript.
+
+The owner adds `OPENAI_API_KEY` in the Vercel project's Environment Variables (the same place as the rest of `.env`), then redeploys. The caps can stay at the defaults.
 
 ```bash
 curl -sS "$FILE_URL" -H "Authorization: Bearer $REPLY_TOKEN" -o photo.jpg
@@ -320,6 +345,12 @@ In a private chat, every message from an allowlisted sender or chat wakes the bo
 - starts with a command from `WAKE_COMMANDS`, such as `/ask` or `/ask@YourBot`, or
 - replies to one of the bot's own messages.
 
+A voice note or a video note cannot @mention the bot, and neither has a caption. When `OPENAI_API_KEY` is set, the bridge transcribes those two kinds in an allowlisted group and treats a transcript that contains the bot's username as a mention. The match is the username as a whole word, with or without a leading `@`, case insensitive. `addressed_how` stays `mention`. A display name is not matched, because the bridge does not know one and a common first name would wake on ordinary speech. A username shorter than five characters is not matched in speech. Pick a distinctive username: if the username is an ordinary word, every voice note that says that word wakes the bot.
+
+Audio files are not addressed this way. They can carry an @mention in the caption, and a spoken name inside a song or a podcast should not override a caption that did not mention the bot. A failed, empty, or missing transcript does not count. With transcription off, a group voice note wakes the bot only the way any other group message does: a reply to the bot, or a command.
+
+Privacy mode is unchanged. Telegram still does not deliver a voice note while privacy is on, unless the note is a reply to the bot, a command, or the bot is an admin. Transcription cannot see a message Telegram withheld. With privacy off, every allowlisted voice note and video note is sent to OpenAI so the bridge can decide, including notes that do not mention the bot and therefore do not wake it. That is the cost of spoken mentions. The audio of an ordinary group text message, a photo, or an unaddressed audio file is not sent.
+
 The bridge keeps other group messages in a per-topic buffer (`CONTEXT_LIMIT`, 10 by default) and attaches them to the next wake as context. It ignores messages from other bots. In Telegram's default privacy mode the bot receives `/ask@YourBot`, replies to its own messages, and service messages. Turn privacy off with BotFather `/setprivacy`, or make the bot an admin, then remove the bot from the group and add it again.
 
 When the bot is in the groups you want, send BotFather `/setjoingroups` and choose Disable to keep it to those groups.
@@ -371,6 +402,9 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | `FORWARD_BURST_MS` | no | Default `1500`. Clamped to 0-5000. Wait after a forward so the sender's following comment joins one wake. `0` wakes on each update immediately. |
 | `MAX_BODY_BYTES` | no | Default `1000000`, minimum 1024. Enforced while streaming, on every host. |
 | `MAX_MEDIA_BYTES` | no | Default `4000000`, minimum 1024, hard cap `4194304` (4 MiB). The multipart upload limit for `POST /send/media`, kept under Vercel's ~4.5 MB request body limit. Larger files use an https `url`. |
+| `OPENAI_API_KEY` | no | OpenAI API key for inbound speech-to-text. Unset leaves transcripts off. At least 20 characters. Add it in Vercel as an environment variable. The model is `gpt-transcribe`. |
+| `TRANSCRIBE_MAX_SECONDS` | no | Default `60`, clamped to 1–180. Used only when `OPENAI_API_KEY` is set. Voice, audio, and video notes longer than this are not transcribed (`transcript_error: "too_long"`). |
+| `TRANSCRIBE_MAX_BYTES` | no | Default `2000000`, clamped to 1024–4000000. Used only when `OPENAI_API_KEY` is set. Larger clips are not transcribed (`transcript_error: "too_large"`). |
 | `ALLOW_INSECURE_WEBHOOK` | no | Default `false`. Allows an `http://` Grok webhook for local development. |
 
 ## Endpoints
@@ -380,7 +414,7 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | `POST` | `/webhook` | Telegram |
 | `POST` | `/send` | The assistant, with the reply token. Text. Returns `message_ids`. |
 | `POST` | `/send/edit` | The assistant, with the reply token. Replaces the text of a message this wake sent. |
-| `POST` | `/send/media` | The assistant, with the reply token. One photo or document, by https URL or a small upload. |
+| `POST` | `/send/media` | The assistant, with the reply token. One photo, document, voice note, or audio file, by https URL or a small upload. |
 | `GET` | `/file/<token>` | The assistant, with the reply token. Streams one file from the wake that signed `<token>`. |
 | `POST` | `/typing/stop` | The assistant, with the reply token. Ends that wake. |
 | `POST` | `/typing/heartbeat` | The assistant, with the reply token. Renews the wake's lease. |
@@ -413,7 +447,7 @@ npm run cf:deploy
 - Inline button `callback_data` is a separate HMAC (`cb1`) over the chat, the owner (or the chat only, for an operator send), the expiry, and the action. A tap from another chat or person fails that check. The token must also be a button on the message Telegram delivered with the tap, so a token from another keyboard in the same chat cannot claim it. The first accepted tap claims the bot message and clears the keyboard. URL buttons are https only.
 - The bridge builds `reply.send_url`, `reply.send_media_url`, `reply.edit_url`, and attachment `file_url`s from `PUBLIC_BASE_URL` only. A file response is proxied. The bridge never redirects to `api.telegram.org`, because that URL contains the bot token.
 - Telegram `getFile` stops at 20 MiB (20971520 bytes). A larger file is described with `file_url: null` and `unavailable: "too_large"`. If Telegram still rejects the download, `GET /file` returns 413 `file_too_large`.
-- `POST /send/media` passes an https URL to Telegram, which downloads it. The bridge does not fetch that URL. It rejects non-https URLs, URLs with credentials, IP literals, localhost, and `api.telegram.org`. An upload is capped by `MAX_MEDIA_BYTES`.
+- `POST /send/media` passes an https URL to Telegram, which downloads it. The bridge does not fetch that URL. It rejects non-https URLs, URLs with credentials, IP literals, localhost, and `api.telegram.org`. An upload is capped by `MAX_MEDIA_BYTES`. `kind: "voice"` is Telegram `sendVoice` (OGG/Opus). `kind: "audio"` is `sendAudio`. A voice upload that is not OGG/Opus is rejected with `bad_voice` before Telegram sees it.
 - The Grok webhook URL comes from configuration. A redirect counts as a failed forward.
 - Text from Telegram users (text, names, titles, `reply_to`, `forward`, `links`, `quote`, `external_reply`, `burst`, contact, location, venue, poll, `short_term`, attachment file names) is untrusted, and so are the bytes behind `file_url`. The bridge does not fetch `links`. It strips control, bidi, zero-width-space, and Unicode tag characters, caps sizes, escapes `<`, `>`, and `&` in the forwarded JSON, and adds `untrusted_content_notice`. The routine prompt tells the assistant to treat that content as data and to send only to the pinned bridge origin.
 - Telegram calls go only to `api.telegram.org`, and only with a well-formed bot token.
@@ -425,3 +459,5 @@ npm run cf:deploy
 ## License
 
 [MIT](LICENSE). Copyright grokbot-telegram contributors.
+
+- Speech bytes go to `https://api.openai.com/v1/audio/transcriptions` only when `OPENAI_API_KEY` is set, only for an allowlisted chat, and only for a voice, audio, or video note inside the duration and size caps. The request does not follow redirects. The key is not in the wake payload. Logs record the outcome, not the transcript and not the key.

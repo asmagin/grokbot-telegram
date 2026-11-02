@@ -1,4 +1,5 @@
 import { classifyAddress, messageText, senderUser, topicThreadId } from "./address.js";
+import { shouldTranscribe, transcribeMessage } from "./transcribe.js";
 import { isAllowlisted } from "./allowlist.js";
 import { callbackButtonText } from "./buttons.js";
 import { canonicalId } from "./config.js";
@@ -12,7 +13,7 @@ import { json, readLimitedBody } from "./http.js";
 import { buildCallbackWakeEvent, buildWakeEvent, toContextMessage } from "./payload.js";
 import { MESSAGE_CLAIM_TTL_MS, rateChatKey, rateUserKey, scopeKey, type PendingBurst } from "./store.js";
 import { cleanLabel, cleanText, fastGreetingReply } from "./text.js";
-import { TELEGRAM_SECRET_HEADER, type AddressHow, type ContextMessage, type TelegramMessage, type TelegramUpdate, type TypingStart } from "./types.js";
+import { TELEGRAM_SECRET_HEADER, type AddressHow, type ContextMessage, type TelegramMessage, type TelegramUpdate, type TranscriptFields, type TypingStart } from "./types.js";
 
 export async function handleWebhook(request: Request, deps: AppDeps): Promise<Response> {
   // Empty, too short, or outside Telegram's secret_token charset all fail closed.
@@ -137,7 +138,24 @@ async function handleClaimedUpdate(
     shortTerm = await deps.store.pushContext(scope, contextMessage, deps.config.contextLimit);
   }
 
-  const address = classifyAddress(message, deps.config);
+  // A group voice note or video note cannot @mention the bot, so when
+  // transcription is on, a transcript that says the username is what decides.
+  // Privacy mode is unchanged: Telegram never delivers a note the bot was
+  // not allowed to see. Audio is transcribed only after the message is
+  // already going to wake the bot, because a caption can carry the @mention.
+  let address = classifyAddress(message, deps.config);
+  let transcripts: ReadonlyMap<string, TranscriptFields> | undefined;
+  if (
+    deps.config.speech
+    && !address.addressed
+    && shouldTranscribe(message, false, deps.config.telegramBotUsername)
+  ) {
+    const speech = await runTranscription(deps, message, chatId);
+    transcripts = speech.byFileId;
+    if (speech.mentioned) {
+      address = { addressed: true, how: "mention", command: address.command };
+    }
+  }
   if (deps.config.forwardBurstMs > 0) {
     const plan = await scheduleBurst(deps, {
       updateId: update.update_id,
@@ -167,7 +185,8 @@ async function handleClaimedUpdate(
         command: address.command,
         shortTerm,
         burstMessages: [],
-        greet: true,
+        transcripts,
+    greet: true,
       }, "background");
     }
   }
@@ -197,6 +216,7 @@ async function handleClaimedUpdate(
     command: address.command,
     shortTerm,
     burstMessages: [],
+    transcripts,
     greet: true,
   }, "background");
 }
@@ -216,6 +236,7 @@ interface WakeLaunch {
   burstMessages: TelegramMessage[];
   /** Fast greeting would hide a merged forward, so burst flushes turn it off. */
   greet: boolean;
+  transcripts?: ReadonlyMap<string, TranscriptFields>;
 }
 
 /**
@@ -413,6 +434,10 @@ async function launchWake(deps: AppDeps, options: WakeLaunch, delivery: "backgro
     return json(200, { ok: true });
   }
 
+  let transcripts = options.transcripts;
+  if (deps.config.speech && !transcripts && shouldTranscribe(message, true, deps.config.telegramBotUsername)) {
+    transcripts = (await runTranscription(deps, message, options.chatId)).byFileId;
+  }
   const wake = await buildWakeEvent({
     config: deps.config,
     message,
@@ -423,6 +448,7 @@ async function launchWake(deps: AppDeps, options: WakeLaunch, delivery: "backgro
     shortTerm: options.shortTerm,
     burstMessages: options.burstMessages,
     nowMs: options.now,
+    ...(transcripts ? { transcripts } : {}),
   });
   if (!wake) {
     deps.log({
@@ -789,4 +815,31 @@ async function deliverWake(
   deps.log({ event: "forward_failure_notice", chat_id: chatId, update_id: wake.update_id, ok: sent.ok });
   // Another wake in this chat may still be working; the notice just cleared its typing.
   if (sent.ok) await deps.typing.touch(session.scopeKey, null).catch(() => undefined);
+}
+
+async function runTranscription(
+  deps: AppDeps,
+  message: TelegramMessage,
+  chatId: string,
+): Promise<{ byFileId?: ReadonlyMap<string, TranscriptFields>; mentioned: boolean }> {
+  if (!deps.config.speech) return { mentioned: false };
+  try {
+    return await transcribeMessage({
+      message,
+      speech: deps.config.speech,
+      telegram: deps.telegram,
+      fetchImpl: deps.fetchImpl,
+      log: deps.log,
+      chatId,
+      username: deps.config.telegramBotUsername,
+      now: () => deps.now(),
+    });
+  } catch (err) {
+    deps.log({
+      event: "transcribe_failed",
+      chat_id: chatId,
+      error: err instanceof Error ? err.name : "error",
+    });
+    return { mentioned: false };
+  }
 }

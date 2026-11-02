@@ -107,10 +107,11 @@ interface MediaBody extends SendBody {
 }
 
 /**
- * Send one photo or document. JSON carries an https URL that Telegram downloads.
- * multipart/form-data uploads the file (field `file`), capped for serverless bodies.
- * final, reply_to, thread, typing, and idempotency match text /send, and a final
- * here consumes the same one-final slot.
+ * Send one photo, document, voice note, or audio file. JSON carries an https URL
+ * that Telegram downloads. multipart/form-data uploads the file (field `file`),
+ * capped for serverless bodies. final, reply_to, thread, typing, and idempotency
+ * match text /send, and a final here consumes the same one-final slot.
+ * `voice` is Telegram sendVoice and must be OGG/Opus. `audio` is sendAudio.
  */
 export async function handleSendMedia(request: Request, deps: AppDeps): Promise<Response> {
   const credential = await authenticate(request, deps);
@@ -764,7 +765,23 @@ interface MediaCommand {
 }
 
 function mediaKind(value: unknown): SendMediaKind | null {
-  return value === "photo" || value === "document" ? value : null;
+  if (value === "photo" || value === "document" || value === "voice" || value === "audio") return value;
+  return null;
+}
+
+const VOICE_UPLOAD_TYPES = new Set(["audio/ogg", "audio/opus", "application/ogg", "application/octet-stream"]);
+
+function asOggName(name: string): string {
+  if (/\.ogg$/i.test(name)) return name;
+  const stem = name.replace(/\.[^.]+$/, "");
+  return `${stem || "voice"}.ogg`;
+}
+
+function defaultMediaName(kind: SendMediaKind): string {
+  if (kind === "photo") return "photo.jpg";
+  if (kind === "voice") return "voice.ogg";
+  if (kind === "audio") return "audio.mp3";
+  return "file";
 }
 
 function sharedMediaFields(body: MediaBody): { ok: true; fields: Omit<MediaCommand, "kind" | "caption" | "source"> & { kind: SendMediaKind; caption: string } } | { ok: false; response: Response } {
@@ -877,13 +894,22 @@ async function readMediaUpload(
     return { ok: false, response: json(400, { ok: false, error: "bad_file" }) };
   }
   if (uploaded.size > maxBytes) return { ok: false, response: json(413, { ok: false, error: "body_too_large" }) };
-  const named = cleanFileName(typeof body.file_name === "string" ? body.file_name : null)
+  let named = cleanFileName(typeof body.file_name === "string" ? body.file_name : null)
     ?? cleanFileName(uploaded.name)
-    ?? (shared.fields.kind === "photo" ? "photo.jpg" : "file");
+    ?? defaultMediaName(shared.fields.kind);
   const bytes = new Uint8Array(await uploaded.arrayBuffer());
-  const mime = typeof uploaded.type === "string" && uploaded.type.length > 0 && uploaded.type.length <= 127
+  const rawType = typeof uploaded.type === "string" && uploaded.type.length > 0 && uploaded.type.length <= 127
     ? uploaded.type
     : "application/octet-stream";
+  const uploadedType = rawType.split(";")[0]?.trim().toLowerCase() || "application/octet-stream";
+  let mime = rawType;
+  if (shared.fields.kind === "voice") {
+    if (!VOICE_UPLOAD_TYPES.has(uploadedType)) {
+      return { ok: false, response: json(400, { ok: false, error: "bad_voice" }) };
+    }
+    named = asOggName(named);
+    mime = "audio/ogg";
+  }
   return {
     ok: true,
     value: {
