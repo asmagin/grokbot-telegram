@@ -14,7 +14,7 @@ export interface SendMessageInput {
 }
 
 export type SendMessageResult =
-  | { ok: true; messageId: number }
+  | { ok: true; messageId: number; notModified?: boolean }
   | {
     ok: false;
     description: string;
@@ -28,6 +28,11 @@ export type CallResult = { ok: true } | { ok: false; description: string; status
 
 export interface TelegramClient {
   sendMessage(input: SendMessageInput): Promise<SendMessageResult>;
+  /**
+   * Replace the text of a message this bot sent. `notModified` means Telegram
+   * already had that text (`message is not modified`), which is success.
+   */
+  editMessageText(input: { chat_id: string; message_id: number; text: string }): Promise<SendMessageResult>;
   /** One photo or document. `url` is fetched by Telegram. `file` is uploaded by the bridge. */
   sendMedia(input: SendMediaInput): Promise<SendMessageResult>;
   /** Bot API getFile. Does not download bytes. */
@@ -77,6 +82,11 @@ export type GetFileResult =
 export type DownloadResult =
   | { ok: true; body: ReadableStream<Uint8Array>; contentLength: number | null }
   | { ok: false; description: string; status: number; tooLarge?: boolean };
+
+/** Telegram returns this when editMessageText is asked to write the text it already has. */
+export function isNotModified(description: string): boolean {
+  return /message is not modified/i.test(description);
+}
 
 export function telegramMethodUrl(token: string, method: string): string | null {
   if (!isPlausibleBotToken(token)) return null;
@@ -216,6 +226,20 @@ export function createTelegramClient(options: {
       };
       const body = JSON.stringify(payload);
       return postWithRetry("sendMessage", () => ({ body, json: true }), 10_000);
+    },
+    async editMessageText(input) {
+      const payload = {
+        chat_id: input.chat_id,
+        message_id: input.message_id,
+        text: input.text,
+      };
+      const body = JSON.stringify(payload);
+      const result = await postWithRetry("editMessageText", () => ({ body, json: true }), 10_000);
+      if (!result.ok && result.status === 400 && isNotModified(result.description)) {
+        return { ok: true, messageId: input.message_id, notModified: true };
+      }
+      if (result.ok) return { ok: true, messageId: input.message_id };
+      return result;
     },
     async sendMedia(input) {
       const method = input.kind === "photo" ? "sendPhoto" : "sendDocument";

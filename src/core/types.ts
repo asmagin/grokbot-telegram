@@ -125,6 +125,8 @@ export interface WakeReply {
   wake_id: string;
   send_url: string;
   send_media_url: string;
+  /** POST here to edit a message this wake already sent through send_url. */
+  edit_url: string;
   typing_stop_url: string;
   heartbeat_url: string;
   chat_id: string;
@@ -197,7 +199,11 @@ export interface TypingWake {
   messageId: number | null;
   /** Emoji this wake set on `messageId` and must clear, or null when it owns no reaction. */
   reaction: string | null;
-  /** Phase 3: keep a sendMessageDraft placeholder up (private chats only). */
+  /**
+   * Private-chat sendMessageDraft preview. Not the progress message: a draft
+   * has no message_id, so the answer cannot replace it. Progress-then-edit
+   * uses /send and /send/edit.
+   */
   draft: boolean;
   draftAt: number | null;
   startedAt: number;

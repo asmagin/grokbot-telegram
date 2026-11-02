@@ -8,6 +8,7 @@
     { "source": "/healthz", "destination": "/api?path=/healthz" },
     { "source": "/webhook", "destination": "/api?path=/webhook" },
     { "source": "/send", "destination": "/api?path=/send" },
+    { "source": "/send/edit", "destination": "/api?path=/send/edit" },
     { "source": "/send/media", "destination": "/api?path=/send/media" },
     { "source": "/file/:token", "destination": "/api?path=/file/:token" },
     { "source": "/typing/stop", "destination": "/api?path=/typing/stop" },

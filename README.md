@@ -39,12 +39,16 @@ sequenceDiagram
   Bridge-->>TG: 200 right away
   Bridge->>TG: setMessageReaction 👀, sendChatAction typing (every 3 s)
   Bridge->>Grok: POST routine URL, Bearer sender key, reply token
-  opt long job
+  alt long job
     Grok->>Bridge: POST /send, one progress line ("final": false)
     Bridge->>TG: sendMessage (silent), then typing again right away
+    Bridge-->>Grok: message_ids
+    Grok->>Bridge: POST /send/edit, the answer ("final": true)
+    Bridge->>TG: editMessageText (sendMessage for any part past 4096)
+  else short job, or the answer is a photo
+    Grok->>Bridge: POST /send or /send/media, the answer ("final": true)
+    Bridge->>TG: sendMessage, sendPhoto, or sendDocument
   end
-  Grok->>Bridge: POST /send, the answer ("final": true)
-  Bridge->>TG: sendMessage
   Bridge->>TG: Clear 👀, stop typing for this wake
 ```
 
@@ -116,7 +120,7 @@ Write the deployment origin into `PUBLIC_BASE_URL` in `.env`. In the Vercel dash
 npx vercel --prod
 ```
 
-`vercel.json` rewrites `/webhook`, `/send`, `/send/media`, `/file/*`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` to `api/index.ts`. Leave `PATH_PREFIX` empty. The function `maxDuration` is 60 seconds so a proxied file can finish. A plan with a shorter cap uses that cap instead.
+`vercel.json` rewrites `/webhook`, `/send`, `/send/edit`, `/send/media`, `/file/*`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` to `api/index.ts`. Leave `PATH_PREFIX` empty. The function `maxDuration` is 60 seconds so a proxied file can finish. A plan with a shorter cap uses that cap instead.
 
 ### Node
 
@@ -163,7 +167,7 @@ Message the bot in a direct chat, then try a group.
 
 ## How the assistant replies
 
-Each accepted update reaches the routine as JSON with `schema_version: 3` ([`schema/wake-event.v3.json`](schema/wake-event.v3.json)). Version 3 adds `message.attachments` and `reply.send_media_url`. Every version 2 field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, and a signed token scoped to that chat and forum topic.
+Each accepted update reaches the routine as JSON with `schema_version: 3` ([`schema/wake-event.v3.json`](schema/wake-event.v3.json)). Version 3 adds `message.attachments`, `reply.send_media_url`, and `reply.edit_url`. Every version 2 field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, `edit_url`, and a signed token scoped to that chat and forum topic. A text send returns the Telegram `message_ids` it created.
 
 ```bash
 curl -sS -X POST "$SEND_URL" \
@@ -172,7 +176,18 @@ curl -sS -X POST "$SEND_URL" \
   -d '{"chat_id":"123","text":"Here is the answer.","reply_to_message_id":10,"final":true}'
 ```
 
-`$SEND_URL` and `$REPLY_TOKEN` are `reply.send_url` and `reply.token`. Put `"final": true` on the answer. Once Telegram accepts it, the bridge stops typing, removes the 👀, and retires the token. Earlier sends are progress lines, and they go out silently.
+`$SEND_URL` and `$REPLY_TOKEN` are `reply.send_url` and `reply.token`. Put `"final": true` on the answer. Once Telegram accepts it, the bridge stops typing, removes the 👀, and retires the token. Earlier sends are progress lines, and they go out silently. The response body includes `message_ids`.
+
+A later `POST` to `reply.edit_url` (`/send/edit`) replaces the text of one of those messages. The same token authorizes it. The bridge keeps the ids it posted for this wake and rejects any other `message_id` with `403 {"ok": false, "error": "not_outbound"}`. `"final": true` on an edit is the answer: it uses the same one-final slot, and once Telegram accepts it the bridge stops typing, removes the 👀, and retires the token. A progress edit (`"final": false`) stays one bubble, renews the lease, and puts typing back. Telegram answers `message is not modified` when the text is already there; the bridge treats that as success, and a final edit still ends the wake.
+
+```bash
+curl -sS -X POST "$EDIT_URL" \
+  -H "Authorization: Bearer $REPLY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id":"123","message_id":55,"text":"Here is the answer.","final":true}'
+```
+
+`$EDIT_URL` is `reply.edit_url`. `message_id` is one id from the earlier `/send` response. An answer longer than 4096 characters is split: the first piece replaces that message and the rest are new messages, which notify. A progress edit over 4096 characters is `413 {"error": "edit_too_long"}`. A final edit that fails after the first piece is updated returns `502` with `"edited": true`. Sending that same edit once more skips bubbles already posted. An edit does not notify by itself. Telegram has no notification flag on `editMessageText`.
 
 A photo or a document uses `reply.send_media_url` (`POST /send/media`) with the same token. `"final": true` on a photo or document is the answer, and it uses the same one-final slot as text. A caption is optional and at most 1024 characters.
 
@@ -201,9 +216,9 @@ curl -sS -X POST "$SEND_MEDIA_URL" \
 
 The token lasts `REPLY_TOKEN_TTL_SECONDS` (30 minutes by default). It works for several sends until the final one, so the assistant can send a progress line and then the answer. It is valid only for its chat and topic. Use a different `REPLY_TOKEN_SECRET` for every bridge, because every bridge that shares a secret accepts the same tokens.
 
-`/send` and `/send/media` share one final slot per wake:
+`/send`, `/send/edit`, and `/send/media` share one final slot per wake:
 
-- **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. A final photo and a final text are the same slot. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
+- **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. A final photo, a final text, and a final edit are the same slot. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
 - **`idempotency_key` on progress lines.** Use 1 to 128 characters from `A-Z a-z 0-9 . _ : -`. A repeat of a delivered key returns `already_sent`. Operator sends with `OUTBOUND_API_KEY` accept a key too.
 - **An ambiguous send counts as sent.** The bridge retries a Telegram send only on HTTP 429. After a timeout, a reset, a 5xx, or an unreadable 200, it returns `502 {"ok": false, "ambiguous": true, "error": "telegram_send_ambiguous"}`. A repeat of that final or key returns `409 {"ambiguous": true, "error": "previous_send_ambiguous"}`. A definite failure (`"ambiguous": false`) frees the final or key, so the missing part can go out once.
 
@@ -237,7 +252,7 @@ On Vercel and Node, dedupe state lasts as long as the process. A Telegram retry 
 
 Cloudflare, Vercel, Fly.io, Railway, Render, and a VPS load the gitignored `.env`. The commands are in [Setup](#setup). `npm run set-webhook` and `npm run set-commands` read that file on every host. Local `wrangler dev` reads it too. Wrangler reads `.dev.vars` when that file exists, so keep the setup values in `.env` alone.
 
-Vercel serves `/webhook`, `/send`, `/send/media`, `/file/*`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` from one function, `api/index.ts`, so every route shares that instance's memory. The 👀 clears when the final answer reaches the instance that took the message. The team Environment Variables page is where Vercel loads `.env`. The next `npx vercel --prod` deploys those values. A file the bot fetches is streamed from Telegram through that function. `vercel.json` sets `maxDuration` to 60 seconds. Photos of a few megabytes finish well inside a shorter plan cap. A file near the 20 MB getFile limit needs the longer cap.
+Vercel serves `/webhook`, `/send`, `/send/edit`, `/send/media`, `/file/*`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` from one function, `api/index.ts`, so every route shares that instance's memory. The 👀 clears when the final answer reaches the instance that took the message. The ids `/send/edit` is allowed to change live in that same memory, so the edit has to reach the instance that sent the message. The team Environment Variables page is where Vercel loads `.env`. The next `npx vercel --prod` deploys those values. A file the bot fetches is streamed from Telegram through that function. `vercel.json` sets `maxDuration` to 60 seconds. Photos of a few megabytes finish well inside a shorter plan cap. A file near the 20 MB getFile limit needs the longer cap.
 
 On Node, `npm start` reads `.env` and listens on `PORT` (default `8080`). Fly.io loads the file with `fly secrets import < .env`. Railway loads it through the Variables RAW Editor. Render loads it by pointing the service environment at `.env`. A VPS loads it by keeping `.env` next to the code.
 
@@ -246,17 +261,19 @@ On Node, `npm start` reads `.env` and listens on `PORT` (default `8080`). Fly.io
 After a message wakes the bot, the person sees:
 
 1. A 👀 reaction on their message and "typing…" in the chat, right away.
-2. On a job of about 45 seconds or more, one short progress line from the assistant, sent silently.
-3. The answer, with a normal notification. The 👀 and typing end when Telegram accepts it.
+2. On a job of about 45 seconds or more, one short progress line from the assistant, sent silently. The assistant then edits that line into the answer, so the person sees one bubble update.
+3. The answer, with a normal notification when it is a new message. The 👀 and typing end when Telegram accepts a `"final": true` send or a `"final": true` edit. An edit of the progress bubble does not itself notify.
 
 The details:
 
 - **Typing per wake.** Each chat and forum topic keeps a set of active wakes. The bridge sends one `sendChatAction` per chat every `TYPING_REFRESH_MS` while any wake is active. A new message adds its own wake.
-- **Ends on delivery.** A `"final": true` send ends its wake after Telegram accepts the whole message. If that send fails, typing, the 👀, and the token stay, so the assistant can finish. `/typing/stop` ends one wake.
-- **Typing returns after a progress line.** Telegram clears typing when the bot posts, so the bridge sends typing again right after each progress line.
-- **Lease.** Each wake starts with a `TYPING_LEASE_MS` lease (10 minutes). Each progress line and each `POST /typing/heartbeat` renews it, up to `TYPING_MAX_MS` (30 minutes) from the start and up to the token's expiry. When the lease ends, the bridge stops typing, clears the 👀, and logs `typing_lease_expired`.
+- **Ends on delivery.** A `"final": true` send or edit ends its wake after Telegram accepts the whole message. If that call fails, typing, the 👀, and the token stay, so the assistant can finish. `/typing/stop` ends one wake. A final edit clears the reaction the same way a final send does. Other wakes in the chat keep theirs, and typing stays up for them.
+- **Typing returns after a progress line or a progress edit.** Telegram clears typing when the bot posts, so the bridge sends typing again right after each non-final send or edit.
+- **One bubble, then edit.** `POST /send` with `"final": false` returns `message_ids`. `POST /send/edit` with that id replaces the text. Only ids this wake's `/send` recorded can be edited, and the bridge checks that itself. A final edit longer than 4096 characters puts the first piece in the existing bubble and sends the rest. Photos and documents are not editable this way; send those as their own final message.
+- **Draft placeholder stays off.** `TELEGRAM_DRAFT_PLACEHOLDER` (`sendMessageDraft`, default `false`) is a private-chat preview that says "Thinking…" for about 30 seconds. It is not this feature. A draft has no `message_id`, it disappears on its own, and Telegram only supports it in private chats, so the answer cannot replace it and a group cannot see it. Leave the flag off. Progress-then-edit is the path that updates one real message in any chat the bot is in.
+- **Lease.** Each wake starts with a `TYPING_LEASE_MS` lease (10 minutes). Each progress line, each progress edit, and each `POST /typing/heartbeat` renews it, up to `TYPING_MAX_MS` (30 minutes) from the start and up to the token's expiry. When the lease ends, the bridge stops typing, clears the 👀, and logs `typing_lease_expired`.
 - **Reaction.** The bridge sets `PROGRESS_REACTION` (default 👀). If a chat limits reactions, the bridge logs `reaction_failed` and keeps typing.
-- **Edits.** One Telegram message starts at most one wake. The bridge ignores edits of a message that already woke the bot and logs `edit_ignored`. An edit that first addresses the bot, such as one that adds `@YourBot`, wakes it once with `edited: true`. The bridge remembers woken messages for 7 days.
+- **Incoming edits.** One Telegram message starts at most one wake. The bridge ignores edits of a message that already woke the bot and logs `edit_ignored`. An edit that first addresses the bot, such as one that adds `@YourBot`, wakes it once with `edited: true`. The bridge remembers woken messages for 7 days.
 - **Failed forward.** The bridge sends each wake to Grok Bot in a single POST.
   - After a definite failure, the bridge stops typing, clears the 👀, and posts `FORWARD_FAILURE_TEXT` once, silently. A definite failure is a non-2xx other than a gateway error, a redirect, a refused connection, a DNS failure, or a TLS failure before the request went out.
   - After an ambiguous failure, the bridge logs `forward_ambiguous` and keeps the wake open until the final send, `/typing/stop`, or the end of the lease. An ambiguous failure is a timeout, a reset, a later network error, or HTTP 502, 504, 520, or 524. A late answer still goes out once.
@@ -313,7 +330,7 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | `TYPING_MAX_MS` | no | Default `1800000` (30 min). Clamped to 60000-7200000. Ceiling per wake from its start. |
 | `PROGRESS_REACTION` | no | Default `👀`. An emoji from the Bot API's `ReactionTypeEmoji` list, or `off`. `/healthz` lists any other value under `problems`, and the bridge uses the default. |
 | `FORWARD_FAILURE_TEXT` | no | Default "Sorry — I couldn't pick that up just now. Mind sending it again?". Up to 500 characters, or `off`. |
-| `TELEGRAM_DRAFT_PLACEHOLDER` | no | Default `false`. Experimental `sendMessageDraft` placeholder in private chats. |
+| `TELEGRAM_DRAFT_PLACEHOLDER` | no | Default `false`. Private-chat `sendMessageDraft` preview. Not the progress-then-edit path; leave it off. |
 | `CONTEXT_LIMIT` | no | Default `10` prior messages per chat and forum topic, up to 7 days old. |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | no | Default 20 wakes per minute per chat and per user in that chat. |
 | `DEDUPE_TTL_MS` | no | Default `86400000` (24 h). How long `update_id` claims and operator `idempotency_key` records last. |
@@ -326,7 +343,8 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | Method | Path | Caller |
 | --- | --- | --- |
 | `POST` | `/webhook` | Telegram |
-| `POST` | `/send` | The assistant, with the reply token. Text. |
+| `POST` | `/send` | The assistant, with the reply token. Text. Returns `message_ids`. |
+| `POST` | `/send/edit` | The assistant, with the reply token. Replaces the text of a message this wake sent. |
 | `POST` | `/send/media` | The assistant, with the reply token. One photo or document, by https URL or a small upload. |
 | `GET` | `/file/<token>` | The assistant, with the reply token. Streams one file from the wake that signed `<token>`. |
 | `POST` | `/typing/stop` | The assistant, with the reply token. Ends that wake. |
@@ -357,14 +375,14 @@ npm run cf:deploy
 - The Node server starts only with a valid webhook secret, `REPLY_TOKEN_SECRET`, and `PUBLIC_BASE_URL`. On Workers and Vercel, `/healthz` reports `ready: false` instead, and the bridge logs each dropped wake at `level: "error"`.
 - An empty allowlist denies everyone.
 - Reply tokens are HMAC-SHA256 over the chat, topic, wake id, and expiry, checked in constant time. A final send retires the token. A file URL is a separate HMAC (`f1~…`) over the same chat, topic, wake, and the Telegram file id. `GET /file` requires both, and the reply token's wake must be the one that signed the file. The long-lived `OUTBOUND_API_KEY` cannot fetch files.
-- The bridge builds `reply.send_url`, `reply.send_media_url`, and attachment `file_url`s from `PUBLIC_BASE_URL` only. A file response is proxied. The bridge never redirects to `api.telegram.org`, because that URL contains the bot token.
+- The bridge builds `reply.send_url`, `reply.send_media_url`, `reply.edit_url`, and attachment `file_url`s from `PUBLIC_BASE_URL` only. A file response is proxied. The bridge never redirects to `api.telegram.org`, because that URL contains the bot token.
 - Telegram `getFile` stops at 20 MiB (20971520 bytes). A larger file is described with `file_url: null` and `unavailable: "too_large"`. If Telegram still rejects the download, `GET /file` returns 413 `file_too_large`.
 - `POST /send/media` passes an https URL to Telegram, which downloads it. The bridge does not fetch that URL. It rejects non-https URLs, URLs with credentials, IP literals, localhost, and `api.telegram.org`. An upload is capped by `MAX_MEDIA_BYTES`.
 - The Grok webhook URL comes from configuration. A redirect counts as a failed forward.
 - Text from Telegram users (text, names, titles, `reply_to`, `short_term`, attachment file names) is untrusted, and so are the bytes behind `file_url`. The bridge strips control, bidi, zero-width-space, and Unicode tag characters, caps sizes, escapes `<`, `>`, and `&` in the forwarded JSON, and adds `untrusted_content_notice`. The routine prompt tells the assistant to treat that content as data and to send only to the pinned bridge origin.
 - Telegram calls go only to `api.telegram.org`, and only with a well-formed bot token.
-- `/send` and `/send/media` check the bearer before they read the body. `GET /file` checks it before calling Telegram.
-- The bridge splits outgoing text at 4096 UTF-16 units, on a paragraph, then a line, then a hard cut that keeps surrogate pairs whole. It sends plain text. On HTTP 429 it waits `retry_after` when that is 5 seconds or less, at most twice, and returns longer waits to the caller as `retry_after`.
+- `/send`, `/send/edit`, and `/send/media` check the bearer before they read the body. `GET /file` checks it before calling Telegram. `/send/edit` allows only message ids this wake's `/send` recorded in the store. The caller cannot widen that set.
+- The bridge splits outgoing text at 4096 UTF-16 units, on a paragraph, then a line, then a hard cut that keeps surrogate pairs whole. It sends plain text. A final edit puts the first piece into the existing message and sends the rest. On HTTP 429 it waits `retry_after` when that is 5 seconds or less, at most twice, and returns longer waits to the caller as `retry_after`. Telegram's `message is not modified` on an edit is success.
 - Logs are single-line JSON. They carry drop reasons (`not_allowlisted`, `not_addressed`, `duplicate`, `rate_limited`) with chat and user ids, which you need for the allowlist. The logger redacts secrets and bearer values.
 - Keep secrets in the gitignored `.env`. Cloudflare, Vercel, Fly.io, Railway, Render, and a VPS load that file. `.env.example` holds placeholders.
 

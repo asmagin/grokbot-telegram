@@ -117,6 +117,50 @@ describe("progress calls", () => {
     expect(calls[0]?.body).toEqual({ chat_id: 42, draft_id: 11, text: "" });
   });
 
+  it("edits text in place and treats 'message is not modified' as success", async () => {
+    const bodies: unknown[] = [];
+    let mode: "ok" | "same" = "ok";
+    const client = createTelegramClient({
+      token: "123456:ABCDEFghij",
+      fetchImpl: async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        if (mode === "same") {
+          return Response.json({ ok: false, error_code: 400, description: "Bad Request: message is not modified" }, { status: 400 });
+        }
+        return Response.json({ ok: true, result: { message_id: 5 } });
+      },
+    });
+    expect(await client.editMessageText({ chat_id: "42", message_id: 5, text: "next" })).toEqual({ ok: true, messageId: 5 });
+    mode = "same";
+    expect(await client.editMessageText({ chat_id: "42", message_id: 5, text: "next" })).toEqual({
+      ok: true,
+      messageId: 5,
+      notModified: true,
+    });
+    expect(bodies[0]).toEqual({ chat_id: "42", message_id: 5, text: "next" });
+    expect(bodies).toHaveLength(2);
+  });
+
+  it("returns a long edit rate limit without retrying", async () => {
+    let posts = 0;
+    const client = createTelegramClient({
+      token: "123456:ABCDEFghij",
+      sleep: async () => undefined,
+      fetchImpl: async () => {
+        posts += 1;
+        return Response.json({
+          ok: false,
+          error_code: 429,
+          description: "Too Many Requests: retry after 30",
+          parameters: { retry_after: 30 },
+        }, { status: 429 });
+      },
+    });
+    const result = await client.editMessageText({ chat_id: "42", message_id: 5, text: "next" });
+    expect(posts).toBe(1);
+    expect(result).toMatchObject({ ok: false, status: 429, retryAfter: 30 });
+  });
+
   it("passes disable_notification through to sendMessage", async () => {
     const { client, calls } = recorder(() => Response.json({ ok: true, result: { message_id: 1 } }));
     await client.sendMessage({ chat_id: "42", text: "quiet", disable_notification: true });

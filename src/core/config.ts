@@ -24,7 +24,11 @@ export interface Config {
   progressReaction: string | null;
   /** Silent line sent when Grok Bot does not accept a wake, or null when disabled. */
   forwardFailureText: string | null;
-  /** Phase 3 experiment: sendMessageDraft "Thinking…" placeholder in private chats. */
+  /**
+   * Private-chat sendMessageDraft "Thinking…" preview. Off by default.
+   * Not used for progress-then-edit: a draft is not a message, expires in
+   * about 30 seconds, and only works in private chats.
+   */
   draftPlaceholder: boolean;
   contextLimit: number;
   rateLimitMax: number;

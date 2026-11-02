@@ -71,6 +71,12 @@ export function defaultResponse(call: RecordedCall, count: number): Response {
   if (url.includes("api.telegram.org") && url.endsWith("/sendMessage")) {
     return Response.json({ ok: true, result: { message_id: 70 + count } });
   }
+  if (url.includes("api.telegram.org") && url.endsWith("/editMessageText")) {
+    const messageId = typeof call.body === "object" && call.body && typeof (call.body as { message_id?: unknown }).message_id === "number"
+      ? (call.body as { message_id: number }).message_id
+      : 70 + count;
+    return Response.json({ ok: true, result: { message_id: messageId } });
+  }
   if (url.startsWith("https://grok.example/hook")) return new Response("accepted", { status: 202 });
   return new Response("unexpected", { status: 500 });
 }

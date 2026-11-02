@@ -210,7 +210,8 @@ async function handleClaimedUpdate(
     wakeId: wake.reply.wake_id,
     messageId: message.message_id,
     reaction: deps.config.progressReaction,
-    // Phase 3, off by default. sendMessageDraft only works in private chats.
+    // Optional private-chat preview, off by default. It is not the progress
+    // message: a draft has no message_id, so /send/edit cannot turn it into the answer.
     draft: deps.config.draftPlaceholder && message.chat.type === "private",
     startedAt: now,
     leaseMs: deps.config.typingLeaseMs,
