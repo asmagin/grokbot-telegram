@@ -167,7 +167,7 @@ Message the bot in a direct chat, then try a group.
 
 ## How the assistant replies
 
-Each accepted update reaches the routine as JSON with `schema_version: 4` ([`schema/wake-event.v4.json`](schema/wake-event.v4.json)). Version 4 adds `callback` and `addressed_how: "callback"` for an inline button tap. `callback` is null on an ordinary message. Version 3 added `message.attachments`, `reply.send_media_url`, and `reply.edit_url`. Every earlier field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, `edit_url`, and a signed token scoped to that chat and forum topic. A text send returns the Telegram `message_ids` it created. New tokens also carry the sender's user id, so a button can be bound to that person.
+Each accepted update reaches the routine as JSON with `schema_version: 4` ([`schema/wake-event.v4.json`](schema/wake-event.v4.json)). Version 4 adds `callback` and `addressed_how: "callback"` for an inline button tap. `callback` is null on an ordinary message. Version 3 added `message.attachments`, `reply.send_media_url`, and `reply.edit_url`. Every earlier field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, `edit_url`, and a signed token scoped to that chat and forum topic. A text send returns the Telegram `message_ids` it created. New tokens also carry the sender's user id, so a button can be bound to that person. Forward origin, links, quotes, external replies, structured contact, location, venue, and poll summaries are also included, with a `message.burst` array when a forward and a comment were merged.
 
 ```bash
 curl -sS -X POST "$SEND_URL" \
@@ -258,6 +258,21 @@ Telegram's `getFile` limit is 20 MiB (20971520 bytes). Over that, `file_url` is 
 The response sets `X-Content-Type-Options: nosniff`. Types the bridge will not label, including `text/html`, are served as `application/octet-stream`. The declared type is still on the attachment as `mime_type`.
 
 File authorization is the signed URL plus the reply token, not a row in the store, so a fetch works on Vercel even when it hits a different instance than the webhook.
+
+## Forwards, replies, quotes, and other messages
+
+All of this is untrusted, same as `message.text`. Sizes are capped. The bridge does not fetch URLs.
+
+- **Forward.** `message.forward` is set when the waking message itself was forwarded. `type` is `user`, `hidden_user`, `chat`, or `channel`. `sender_name`, `username`, `chat_title`, and `date` (unix time of the original) describe the origin. `message.text` and `message.attachments` are the forwarded text or caption and its files. Legacy `forward_from` / `forward_sender_name` / `forward_from_chat` updates are read the same way.
+- **Reply.** `message.reply_to` is the parent in this chat, including when that parent is not the bot. It carries text or caption, `from`, `attachments`, `links`, and a contact, location, venue, or poll when the parent had one. Files on the parent are fetched with this wake's reply token.
+- **Quote.** `message.quote` is the highlighted fragment: `text`, `position`, `is_manual`.
+- **Other chat.** `message.external_reply` is a reply to another chat. Telegram does not include that message's text. The object has `origin` (same shape as `message.forward`), `chat_title`, `chat_username`, `message_id`, and any media or attachments.
+- **Links.** `message.links` lists `url` and `text_link` entities: `{kind, url, text}`. `text` is the visible label for a `text_link` and null for a plain url. At most 10, http and https only, no credentials.
+- **Contact, location, venue, poll.** Each is a compact object or null. A venue message also keeps its point in `location`. `message.media` still lists the kind names. A poll has `question`, `type`, up to 10 `options` of `{text, voter_count}`, and the counts.
+
+Telegram sends a forward and the person's comment ("handle this") as two updates, the forward first, and it waits for the webhook response before the next update. The bridge answers 200 immediately and holds the forward in the chat's store for `FORWARD_BURST_MS` (default 1500, maximum 5000). A following message from the same sender, in the same chat and forum topic, joins that burst and resets the wait. One wake goes out: `message` is the comment when there is one, so the reply threads under it, and `message.burst` is the earlier messages in order (text, sender, forward origin, attachments, links, and the same summaries). A forward with no comment is a normal wake with `message.forward` set and `burst` empty. A group forward that nobody follows does not wake the bot. `0` turns the wait off, and each update wakes on its own.
+
+The wait uses the same store as dedupe. On Cloudflare the chat Durable Object is shared, so the two updates merge. On Node one process shares the store, so they merge. On Vercel the store is the memory of one instance. They merge when both updates hit that instance, which is common on a warm function and not guaranteed. When they miss, the bot gets two wakes: the forward, then the comment. `short_term` on the later wake includes the earlier text only if both updates hit the same store. If the instance stops during the wait, Telegram will not retry that update. A later message in the same chat within 60 seconds flushes a burst that was left behind; after that the burst is dropped. Set `FORWARD_BURST_MS=0` to skip the wait.
 
 ## Hosts
 
@@ -353,6 +368,7 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | `CONTEXT_LIMIT` | no | Default `10` prior messages per chat and forum topic, up to 7 days old. |
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | no | Default 20 wakes per minute per chat and per user in that chat. |
 | `DEDUPE_TTL_MS` | no | Default `86400000` (24 h). How long `update_id` claims and operator `idempotency_key` records last. |
+| `FORWARD_BURST_MS` | no | Default `1500`. Clamped to 0-5000. Wait after a forward so the sender's following comment joins one wake. `0` wakes on each update immediately. |
 | `MAX_BODY_BYTES` | no | Default `1000000`, minimum 1024. Enforced while streaming, on every host. |
 | `MAX_MEDIA_BYTES` | no | Default `4000000`, minimum 1024, hard cap `4194304` (4 MiB). The multipart upload limit for `POST /send/media`, kept under Vercel's ~4.5 MB request body limit. Larger files use an https `url`. |
 | `ALLOW_INSECURE_WEBHOOK` | no | Default `false`. Allows an `http://` Grok webhook for local development. |
@@ -399,7 +415,7 @@ npm run cf:deploy
 - Telegram `getFile` stops at 20 MiB (20971520 bytes). A larger file is described with `file_url: null` and `unavailable: "too_large"`. If Telegram still rejects the download, `GET /file` returns 413 `file_too_large`.
 - `POST /send/media` passes an https URL to Telegram, which downloads it. The bridge does not fetch that URL. It rejects non-https URLs, URLs with credentials, IP literals, localhost, and `api.telegram.org`. An upload is capped by `MAX_MEDIA_BYTES`.
 - The Grok webhook URL comes from configuration. A redirect counts as a failed forward.
-- Text from Telegram users (text, names, titles, `reply_to`, `short_term`, attachment file names) is untrusted, and so are the bytes behind `file_url`. The bridge strips control, bidi, zero-width-space, and Unicode tag characters, caps sizes, escapes `<`, `>`, and `&` in the forwarded JSON, and adds `untrusted_content_notice`. The routine prompt tells the assistant to treat that content as data and to send only to the pinned bridge origin.
+- Text from Telegram users (text, names, titles, `reply_to`, `forward`, `links`, `quote`, `external_reply`, `burst`, contact, location, venue, poll, `short_term`, attachment file names) is untrusted, and so are the bytes behind `file_url`. The bridge does not fetch `links`. It strips control, bidi, zero-width-space, and Unicode tag characters, caps sizes, escapes `<`, `>`, and `&` in the forwarded JSON, and adds `untrusted_content_notice`. The routine prompt tells the assistant to treat that content as data and to send only to the pinned bridge origin.
 - Telegram calls go only to `api.telegram.org`, and only with a well-formed bot token.
 - `/send`, `/send/edit`, and `/send/media` check the bearer before they read the body. `GET /file` checks it before calling Telegram. `/send/edit` allows only message ids this wake's `/send` recorded in the store. The caller cannot widen that set.
 - The bridge splits outgoing text at 4096 UTF-16 units, on a paragraph, then a line, then a hard cut that keeps surrogate pairs whole. It sends plain text. A final edit puts the first piece into the existing message and sends the rest. On HTTP 429 it waits `retry_after` when that is 5 seconds or less, at most twice, and returns longer waits to the caller as `retry_after`. Telegram's `message is not modified` on an edit is success.

@@ -3,7 +3,7 @@ import { handleDoAlarm, handleDoFetch, type DoStorage } from "./do-storage.js";
 /**
  * One Durable Object class, two roles:
  * - name `dedupe` holds update-id claims and closed wake ids (serialized, so retries cannot double-wake)
- * - name `chat:<id>` holds that chat's context, rate limit, and typing alarm
+ * - name `chat:<id>` holds that chat's context, rate limit, forward burst, and typing alarm
  */
 export class ChatSession {
   private readonly storage: DoStorage;

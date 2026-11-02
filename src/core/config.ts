@@ -40,6 +40,11 @@ export interface Config {
   /** Cap for a multipart upload to /send/media. Stays under Vercel's ~4.5 MB body limit. */
   maxMediaBytes: number;
   dedupeTtlMs: number;
+  /**
+   * How long to hold a forward before waking, so a comment sent right after it
+   * can join the same wake. 0 wakes on each update immediately.
+   */
+  forwardBurstMs: number;
   allowInsecureWebhook: boolean;
   /** Names of settings that were present but rejected. Never contains values. */
   problems: string[];
@@ -227,6 +232,7 @@ export function loadConfig(env: EnvSource): Config {
     // 4_000_000 leaves room under Vercel's ~4.5 MB platform body limit. Hard cap 4 MiB.
     maxMediaBytes: Math.min(4_194_304, Math.max(1024, readInt(env, "MAX_MEDIA_BYTES", 4_000_000))),
     dedupeTtlMs: Math.max(1000, readInt(env, "DEDUPE_TTL_MS", 86_400_000)),
+    forwardBurstMs: readBoundedInt(env, "FORWARD_BURST_MS", 1500, 0, 5000),
     allowInsecureWebhook,
     problems,
   };

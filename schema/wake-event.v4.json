@@ -50,27 +50,49 @@
     "message": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["message_id", "text", "date", "message_thread_id", "media", "attachments", "reply_to"],
+      "required": ["message_id", "text", "date", "message_thread_id", "media", "attachments", "forward", "links", "quote", "external_reply", "contact", "location", "venue", "poll", "burst", "reply_to"],
       "properties": {
         "message_id": { "type": "integer" },
-        "text": { "type": "string", "maxLength": 4000, "description": "Untrusted. The message text, or the caption when the message is a photo, document, or other media. Control and bidi-override characters removed." },
+        "text": { "type": "string", "maxLength": 4000, "description": "Untrusted. The message text, or the caption when the message is a photo, document, or other media. For a forward, this is the forwarded text or caption. Control and bidi-override characters removed." },
         "date": { "type": ["integer", "null"] },
         "message_thread_id": { "type": ["integer", "null"] },
-        "media": { "type": "array", "items": { "type": "string" }, "description": "Kind names, including non-file kinds such as contact. Fetchable files are in attachments." },
+        "media": { "type": "array", "items": { "type": "string" }, "description": "Kind names, including non-file kinds such as contact, location, venue, and poll. Fetchable files are in attachments." },
         "attachments": {
           "type": "array",
           "description": "Files on this message. Empty when there is nothing to fetch. GET file_url with Authorization: Bearer <reply.token>. The token is scoped to this wake's chat, topic, and wake_id. file_url is null when unavailable is too_large (Telegram getFile refuses files over 20971520 bytes).",
           "items": { "$ref": "#/$defs/attachment" }
         },
+        "forward": {
+          "description": "Set when this message is a forward. type, sender_name, username, chat_title, and date are the origin. Null when the user wrote this message.",
+          "oneOf": [{ "$ref": "#/$defs/forward_origin" }, { "type": "null" }]
+        },
+        "links": {
+          "type": "array",
+          "maxItems": 10,
+          "description": "url and text_link entities on this message. The bridge does not fetch them.",
+          "items": { "$ref": "#/$defs/link" }
+        },
+        "quote": {
+          "description": "Partial text the user highlighted when replying. Null when they did not quote a fragment.",
+          "oneOf": [{ "$ref": "#/$defs/quote" }, { "type": "null" }]
+        },
+        "external_reply": {
+          "description": "Reply to a message in another chat. Telegram does not include that message's text; quote may carry a fragment. Null when absent.",
+          "oneOf": [{ "$ref": "#/$defs/external_reply" }, { "type": "null" }]
+        },
+        "contact": { "oneOf": [{ "$ref": "#/$defs/contact" }, { "type": "null" }] },
+        "location": { "oneOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] },
+        "venue": { "oneOf": [{ "$ref": "#/$defs/venue" }, { "type": "null" }] },
+        "poll": { "oneOf": [{ "$ref": "#/$defs/poll" }, { "type": "null" }] },
+        "burst": {
+          "type": "array",
+          "maxItems": 8,
+          "description": "Earlier updates merged into this wake, oldest first. Empty when this wake is a single update. A forward followed by the sender's comment lands here, and message is the comment.",
+          "items": { "$ref": "#/$defs/burst_item" }
+        },
         "reply_to": {
-          "type": ["object", "null"],
-          "additionalProperties": false,
-          "required": ["message_id", "text", "from"],
-          "properties": {
-            "message_id": { "type": "integer" },
-            "text": { "type": "string", "maxLength": 4000 },
-            "from": { "$ref": "#/$defs/user" }
-          }
+          "description": "The message in this chat they replied to, even when it is not the bot's. Null when this message is not a reply. Text is the parent text or caption.",
+          "oneOf": [{ "$ref": "#/$defs/reply_to" }, { "type": "null" }]
         }
       }
     },
@@ -131,6 +153,155 @@
         "first_name": { "type": ["string", "null"], "maxLength": 64 },
         "last_name": { "type": ["string", "null"], "maxLength": 64 },
         "is_bot": { "type": "boolean" }
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "url", "text"],
+      "properties": {
+        "kind": { "enum": ["url", "text_link"] },
+        "url": { "type": "string", "maxLength": 2048, "description": "http or https, no credentials. Not fetched by the bridge." },
+        "text": { "type": ["string", "null"], "maxLength": 200, "description": "Visible label for a text_link. Null for a plain url entity." }
+      }
+    },
+    "forward_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "date", "sender_name", "username", "chat_title", "message_id"],
+      "properties": {
+        "type": { "enum": ["user", "hidden_user", "chat", "channel"] },
+        "date": { "type": ["integer", "null"], "description": "Unix time of the original message." },
+        "sender_name": { "type": ["string", "null"], "maxLength": 128, "description": "Display name, hidden-user name, or channel author signature." },
+        "username": { "type": ["string", "null"], "maxLength": 32 },
+        "chat_title": { "type": ["string", "null"], "maxLength": 128 },
+        "message_id": { "type": ["integer", "null"], "description": "Original message id when the origin is a channel and Telegram sent one." }
+      }
+    },
+    "contact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phone_number", "first_name", "last_name", "user_id"],
+      "properties": {
+        "phone_number": { "type": ["string", "null"], "maxLength": 32 },
+        "first_name": { "type": ["string", "null"], "maxLength": 64 },
+        "last_name": { "type": ["string", "null"], "maxLength": 64 },
+        "user_id": { "type": ["string", "null"] }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["latitude", "longitude", "horizontal_accuracy", "live_period"],
+      "properties": {
+        "latitude": { "type": "number", "minimum": -90, "maximum": 90 },
+        "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+        "horizontal_accuracy": { "type": ["number", "null"], "minimum": 0 },
+        "live_period": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "venue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "address", "latitude", "longitude", "foursquare_id", "google_place_id"],
+      "properties": {
+        "title": { "type": ["string", "null"], "maxLength": 128 },
+        "address": { "type": ["string", "null"], "maxLength": 200 },
+        "latitude": { "type": ["number", "null"] },
+        "longitude": { "type": ["number", "null"] },
+        "foursquare_id": { "type": ["string", "null"], "maxLength": 128 },
+        "google_place_id": { "type": ["string", "null"], "maxLength": 128 }
+      }
+    },
+    "poll_option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "voter_count"],
+      "properties": {
+        "text": { "type": "string", "maxLength": 100 },
+        "voter_count": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "poll": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question", "type", "options", "total_voter_count", "is_closed", "is_anonymous", "allows_multiple_answers", "correct_option_id"],
+      "properties": {
+        "question": { "type": "string", "maxLength": 300 },
+        "type": { "enum": ["regular", "quiz", "unknown"] },
+        "options": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/poll_option" } },
+        "total_voter_count": { "type": ["integer", "null"], "minimum": 0 },
+        "is_closed": { "type": "boolean" },
+        "is_anonymous": { "type": "boolean" },
+        "allows_multiple_answers": { "type": "boolean" },
+        "correct_option_id": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "quote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "position", "is_manual"],
+      "properties": {
+        "text": { "type": "string", "maxLength": 1000, "description": "Untrusted partial quote." },
+        "position": { "type": ["integer", "null"], "minimum": 0 },
+        "is_manual": { "type": "boolean" }
+      }
+    },
+    "external_reply": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["origin", "chat_title", "chat_username", "message_id", "media", "attachments", "contact", "location", "venue", "poll"],
+      "properties": {
+        "origin": { "oneOf": [{ "$ref": "#/$defs/forward_origin" }, { "type": "null" }] },
+        "chat_title": { "type": ["string", "null"], "maxLength": 128 },
+        "chat_username": { "type": ["string", "null"], "maxLength": 32 },
+        "message_id": { "type": ["integer", "null"] },
+        "media": { "type": "array", "items": { "type": "string" } },
+        "attachments": { "type": "array", "items": { "$ref": "#/$defs/attachment" } },
+        "contact": { "oneOf": [{ "$ref": "#/$defs/contact" }, { "type": "null" }] },
+        "location": { "oneOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] },
+        "venue": { "oneOf": [{ "$ref": "#/$defs/venue" }, { "type": "null" }] },
+        "poll": { "oneOf": [{ "$ref": "#/$defs/poll" }, { "type": "null" }] }
+      }
+    },
+    "reply_to": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message_id", "text", "from", "media", "attachments", "links", "contact", "location", "venue", "poll"],
+      "properties": {
+        "message_id": { "type": "integer" },
+        "text": { "type": "string", "maxLength": 4000, "description": "Parent text or caption. Untrusted." },
+        "from": { "$ref": "#/$defs/user" },
+        "media": { "type": "array", "items": { "type": "string" } },
+        "attachments": {
+          "type": "array",
+          "description": "Files on the parent. GET file_url with this wake's reply token.",
+          "items": { "$ref": "#/$defs/attachment" }
+        },
+        "links": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/link" } },
+        "contact": { "oneOf": [{ "$ref": "#/$defs/contact" }, { "type": "null" }] },
+        "location": { "oneOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] },
+        "venue": { "oneOf": [{ "$ref": "#/$defs/venue" }, { "type": "null" }] },
+        "poll": { "oneOf": [{ "$ref": "#/$defs/poll" }, { "type": "null" }] }
+      }
+    },
+    "burst_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message_id", "text", "date", "from", "media", "attachments", "links", "forward", "contact", "location", "venue", "poll"],
+      "properties": {
+        "message_id": { "type": "integer" },
+        "text": { "type": "string", "maxLength": 4000 },
+        "date": { "type": ["integer", "null"] },
+        "from": { "$ref": "#/$defs/user" },
+        "media": { "type": "array", "items": { "type": "string" } },
+        "attachments": { "type": "array", "items": { "$ref": "#/$defs/attachment" } },
+        "links": { "type": "array", "maxItems": 10, "items": { "$ref": "#/$defs/link" } },
+        "forward": { "oneOf": [{ "$ref": "#/$defs/forward_origin" }, { "type": "null" }] },
+        "contact": { "oneOf": [{ "$ref": "#/$defs/contact" }, { "type": "null" }] },
+        "location": { "oneOf": [{ "$ref": "#/$defs/location" }, { "type": "null" }] },
+        "venue": { "oneOf": [{ "$ref": "#/$defs/venue" }, { "type": "null" }] },
+        "poll": { "oneOf": [{ "$ref": "#/$defs/poll" }, { "type": "null" }] }
       }
     },
     "attachment": {

@@ -74,6 +74,7 @@ export function mediaKinds(message: {
   video_note?: unknown;
   contact?: unknown;
   location?: unknown;
+  venue?: unknown;
   poll?: unknown;
 }): string[] {
   const kinds: string[] = [];
@@ -87,6 +88,7 @@ export function mediaKinds(message: {
   if (message.video_note) kinds.push("video_note");
   if (message.contact) kinds.push("contact");
   if (message.location) kinds.push("location");
+  if (message.venue) kinds.push("venue");
   if (message.poll) kinds.push("poll");
   return kinds;
 }
