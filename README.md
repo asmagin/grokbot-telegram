@@ -116,7 +116,7 @@ Write the deployment origin into `PUBLIC_BASE_URL` in `.env`. In the Vercel dash
 npx vercel --prod
 ```
 
-`vercel.json` rewrites `/webhook`, `/send`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` to `api/index.ts`. Leave `PATH_PREFIX` empty.
+`vercel.json` rewrites `/webhook`, `/send`, `/send/media`, `/file/*`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` to `api/index.ts`. Leave `PATH_PREFIX` empty. The function `maxDuration` is 60 seconds so a proxied file can finish. A plan with a shorter cap uses that cap instead.
 
 ### Node
 
@@ -163,7 +163,7 @@ Message the bot in a direct chat, then try a group.
 
 ## How the assistant replies
 
-Each accepted update reaches the routine as JSON with `schema_version: 2` ([`schema/wake-event.v2.json`](schema/wake-event.v2.json)). The `reply` object holds `send_url` and a signed token scoped to that chat and forum topic.
+Each accepted update reaches the routine as JSON with `schema_version: 3` ([`schema/wake-event.v3.json`](schema/wake-event.v3.json)). Version 3 adds `message.attachments` and `reply.send_media_url`. Every version 2 field is still there, and `POST /send` with text works as before. The `reply` object holds `send_url`, `send_media_url`, and a signed token scoped to that chat and forum topic.
 
 ```bash
 curl -sS -X POST "$SEND_URL" \
@@ -174,13 +174,56 @@ curl -sS -X POST "$SEND_URL" \
 
 `$SEND_URL` and `$REPLY_TOKEN` are `reply.send_url` and `reply.token`. Put `"final": true` on the answer. Once Telegram accepts it, the bridge stops typing, removes the 👀, and retires the token. Earlier sends are progress lines, and they go out silently.
 
+A photo or a document uses `reply.send_media_url` (`POST /send/media`) with the same token. `"final": true` on a photo or document is the answer, and it uses the same one-final slot as text. A caption is optional and at most 1024 characters.
+
+```bash
+curl -sS -X POST "$SEND_MEDIA_URL" \
+  -H "Authorization: Bearer $REPLY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_id":"123","kind":"photo","url":"https://cdn.example/plot.png","caption":"Last week","reply_to_message_id":10,"final":true}'
+```
+
+`kind` is `photo` or `document`. `url` must be `https`, with a hostname, and no username or password. The bridge does not download it. Telegram does. That keeps the request small on Vercel, whose platform body limit is about 4.5 MB. Telegram's own limits apply: photos about 10 MB, documents about 50 MB.
+
+A small file can be uploaded instead, as `multipart/form-data`. The file field is `file`. The other fields are text, and `final` is the string `true` or `false`. The whole request must fit in `MAX_MEDIA_BYTES` (default 4,000,000, hard cap 4,194,304).
+
+```bash
+curl -sS -X POST "$SEND_MEDIA_URL" \
+  -H "Authorization: Bearer $REPLY_TOKEN" \
+  -F "chat_id=123" \
+  -F "kind=document" \
+  -F "caption=Notes" \
+  -F "file_name=notes.txt" \
+  -F "final=true" \
+  -F "reply_to_message_id=10" \
+  -F "file=@notes.txt"
+```
+
 The token lasts `REPLY_TOKEN_TTL_SECONDS` (30 minutes by default). It works for several sends until the final one, so the assistant can send a progress line and then the answer. It is valid only for its chat and topic. Use a different `REPLY_TOKEN_SECRET` for every bridge, because every bridge that shares a secret accepts the same tokens.
 
-`/send` keeps each answer to one Telegram message:
+`/send` and `/send/media` share one final slot per wake:
 
-- **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
+- **One final per wake.** A repeated `"final": true` after delivery returns `200 {"ok": true, "already_sent": true, "message_ids": [...]}`. A final photo and a final text are the same slot. The record lasts as long as the token. When two finals race, one sends and the other gets `409 {"ok": false, "ambiguous": true, "error": "send_in_progress"}`.
 - **`idempotency_key` on progress lines.** Use 1 to 128 characters from `A-Z a-z 0-9 . _ : -`. A repeat of a delivered key returns `already_sent`. Operator sends with `OUTBOUND_API_KEY` accept a key too.
 - **An ambiguous send counts as sent.** The bridge retries a Telegram send only on HTTP 429. After a timeout, a reset, a 5xx, or an unreadable 200, it returns `502 {"ok": false, "ambiguous": true, "error": "telegram_send_ambiguous"}`. A repeat of that final or key returns `409 {"ambiguous": true, "error": "previous_send_ambiguous"}`. A definite failure (`"ambiguous": false`) frees the final or key, so the missing part can go out once.
+
+## Incoming files
+
+A photo, document, video, animation, audio, voice message, video note, or sticker arrives as `message.attachments`. The caption is `message.text`. `message.media` is still the list of kind names, including kinds that are not files (`contact`, `location`, `poll`).
+
+Each attachment has `kind`, `mime_type`, `file_name`, `file_size`, `width`, `height`, `duration`, `file_url`, and `unavailable`. For a photo, the bridge picks the largest size. The file id stays inside a signed token. The bot token is not in the payload.
+
+```bash
+curl -sS "$FILE_URL" -H "Authorization: Bearer $REPLY_TOKEN" -o photo.jpg
+```
+
+`$FILE_URL` is that attachment's `file_url`. The bridge calls Telegram `getFile` and streams the bytes. `GET` needs the reply token from the same wake. A token from another chat, topic, or wake gets 403 `scope`. `OUTBOUND_API_KEY` cannot fetch files. Fetching does not send a message and does not end the wake. The URL works until the token expires.
+
+Telegram's `getFile` limit is 20 MiB (20971520 bytes). Over that, `file_url` is null and `unavailable` is `"too_large"`. A download Telegram still rejects returns `413 {"ok": false, "error": "file_too_large", "limit": 20971520}`.
+
+The response sets `X-Content-Type-Options: nosniff`. Types the bridge will not label, including `text/html`, are served as `application/octet-stream`. The declared type is still on the attachment as `mime_type`.
+
+File authorization is the signed URL plus the reply token, not a row in the store, so a fetch works on Vercel even when it hits a different instance than the webhook.
 
 ## Hosts
 
@@ -194,7 +237,7 @@ On Vercel and Node, dedupe state lasts as long as the process. A Telegram retry 
 
 Cloudflare, Vercel, Fly.io, Railway, Render, and a VPS load the gitignored `.env`. The commands are in [Setup](#setup). `npm run set-webhook` and `npm run set-commands` read that file on every host. Local `wrangler dev` reads it too. Wrangler reads `.dev.vars` when that file exists, so keep the setup values in `.env` alone.
 
-Vercel serves `/webhook`, `/send`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` from one function, `api/index.ts`, so every route shares that instance's memory. The 👀 clears when the final answer reaches the instance that took the message. The team Environment Variables page is where Vercel loads `.env`. The next `npx vercel --prod` deploys those values.
+Vercel serves `/webhook`, `/send`, `/send/media`, `/file/*`, `/typing/stop`, `/typing/heartbeat`, and `/healthz` from one function, `api/index.ts`, so every route shares that instance's memory. The 👀 clears when the final answer reaches the instance that took the message. The team Environment Variables page is where Vercel loads `.env`. The next `npx vercel --prod` deploys those values. A file the bot fetches is streamed from Telegram through that function. `vercel.json` sets `maxDuration` to 60 seconds. Photos of a few megabytes finish well inside a shorter plan cap. A file near the 20 MB getFile limit needs the longer cap.
 
 On Node, `npm start` reads `.env` and listens on `PORT` (default `8080`). Fly.io loads the file with `fly secrets import < .env`. Railway loads it through the Variables RAW Editor. Render loads it by pointing the service environment at `.env`. A VPS loads it by keeping `.env` next to the code.
 
@@ -275,6 +318,7 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW_MS` | no | Default 20 wakes per minute per chat and per user in that chat. |
 | `DEDUPE_TTL_MS` | no | Default `86400000` (24 h). How long `update_id` claims and operator `idempotency_key` records last. |
 | `MAX_BODY_BYTES` | no | Default `1000000`, minimum 1024. Enforced while streaming, on every host. |
+| `MAX_MEDIA_BYTES` | no | Default `4000000`, minimum 1024, hard cap `4194304` (4 MiB). The multipart upload limit for `POST /send/media`, kept under Vercel's ~4.5 MB request body limit. Larger files use an https `url`. |
 | `ALLOW_INSECURE_WEBHOOK` | no | Default `false`. Allows an `http://` Grok webhook for local development. |
 
 ## Endpoints
@@ -282,7 +326,9 @@ Messages sent as a chat (anonymous group admins, or posts as a channel) carry `s
 | Method | Path | Caller |
 | --- | --- | --- |
 | `POST` | `/webhook` | Telegram |
-| `POST` | `/send` | The assistant, with the reply token |
+| `POST` | `/send` | The assistant, with the reply token. Text. |
+| `POST` | `/send/media` | The assistant, with the reply token. One photo or document, by https URL or a small upload. |
+| `GET` | `/file/<token>` | The assistant, with the reply token. Streams one file from the wake that signed `<token>`. |
 | `POST` | `/typing/stop` | The assistant, with the reply token. Ends that wake. |
 | `POST` | `/typing/heartbeat` | The assistant, with the reply token. Renews the wake's lease. |
 | `GET` | `/healthz` | You, or your platform's health check |
@@ -310,12 +356,14 @@ npm run cf:deploy
 - The bridge compares `X-Telegram-Bot-Api-Secret-Token` with `TELEGRAM_WEBHOOK_SECRET` in constant time. If the secret is unset or invalid, `/webhook` returns 503.
 - The Node server starts only with a valid webhook secret, `REPLY_TOKEN_SECRET`, and `PUBLIC_BASE_URL`. On Workers and Vercel, `/healthz` reports `ready: false` instead, and the bridge logs each dropped wake at `level: "error"`.
 - An empty allowlist denies everyone.
-- Reply tokens are HMAC-SHA256 over the chat, topic, wake id, and expiry, checked in constant time. A final send retires the token.
-- The bridge builds `reply.send_url` from `PUBLIC_BASE_URL` only.
+- Reply tokens are HMAC-SHA256 over the chat, topic, wake id, and expiry, checked in constant time. A final send retires the token. A file URL is a separate HMAC (`f1~…`) over the same chat, topic, wake, and the Telegram file id. `GET /file` requires both, and the reply token's wake must be the one that signed the file. The long-lived `OUTBOUND_API_KEY` cannot fetch files.
+- The bridge builds `reply.send_url`, `reply.send_media_url`, and attachment `file_url`s from `PUBLIC_BASE_URL` only. A file response is proxied. The bridge never redirects to `api.telegram.org`, because that URL contains the bot token.
+- Telegram `getFile` stops at 20 MiB (20971520 bytes). A larger file is described with `file_url: null` and `unavailable: "too_large"`. If Telegram still rejects the download, `GET /file` returns 413 `file_too_large`.
+- `POST /send/media` passes an https URL to Telegram, which downloads it. The bridge does not fetch that URL. It rejects non-https URLs, URLs with credentials, IP literals, localhost, and `api.telegram.org`. An upload is capped by `MAX_MEDIA_BYTES`.
 - The Grok webhook URL comes from configuration. A redirect counts as a failed forward.
-- Text from Telegram users (text, names, titles, `reply_to`, `short_term`) is untrusted. The bridge strips control, bidi, zero-width-space, and Unicode tag characters, caps sizes, escapes `<`, `>`, and `&` in the forwarded JSON, and adds `untrusted_content_notice`. The routine prompt tells the assistant to treat that content as data and to send only to the pinned bridge origin.
+- Text from Telegram users (text, names, titles, `reply_to`, `short_term`, attachment file names) is untrusted, and so are the bytes behind `file_url`. The bridge strips control, bidi, zero-width-space, and Unicode tag characters, caps sizes, escapes `<`, `>`, and `&` in the forwarded JSON, and adds `untrusted_content_notice`. The routine prompt tells the assistant to treat that content as data and to send only to the pinned bridge origin.
 - Telegram calls go only to `api.telegram.org`, and only with a well-formed bot token.
-- `/send` checks the bearer before it reads the body.
+- `/send` and `/send/media` check the bearer before they read the body. `GET /file` checks it before calling Telegram.
 - The bridge splits outgoing text at 4096 UTF-16 units, on a paragraph, then a line, then a hard cut that keeps surrogate pairs whole. It sends plain text. On HTTP 429 it waits `retry_after` when that is 5 seconds or less, at most twice, and returns longer waits to the caller as `retry_after`.
 - Logs are single-line JSON. They carry drop reasons (`not_allowlisted`, `not_addressed`, `duplicate`, `rate_limited`) with chat and user ids, which you need for the allowlist. The logger redacts secrets and bearer values.
 - Keep secrets in the gitignored `.env`. Cloudflare, Vercel, Fly.io, Railway, Render, and a VPS load that file. `.env.example` holds placeholders.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { replyTokenScopeOk, secretsEqual, signReplyToken, timingSafeEqual, verifyReplyToken } from "../src/core/crypto.js";
-import type { ReplyClaims } from "../src/core/types.js";
+import { replyTokenScopeOk, secretsEqual, signFileToken, signReplyToken, timingSafeEqual, verifyFileToken, verifyReplyToken } from "../src/core/crypto.js";
+import type { FileClaims, ReplyClaims } from "../src/core/types.js";
 
 const secret = "reply-token-secret";
 
@@ -79,6 +79,51 @@ describe("secret compare", () => {
     expect(timingSafeEqual(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3]))).toBe(true);
     expect(timingSafeEqual(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 4]))).toBe(false);
     expect(timingSafeEqual(new Uint8Array([1]), new Uint8Array([1, 2]))).toBe(false);
+  });
+});
+
+function fileClaims(overrides: Partial<FileClaims> = {}): FileClaims {
+  return {
+    v: 1,
+    chat_id: "42",
+    thread_id: null,
+    wake_id: "wake-1",
+    file_id: "photoBig",
+    exp: 1_800_000_000,
+    kind: "photo",
+    mime: "image/jpeg",
+    name: null,
+    ...overrides,
+  };
+}
+
+describe("file tokens", () => {
+  it("signs and verifies a file token, and does not accept it as a reply token", async () => {
+    const token = await signFileToken(secret, fileClaims());
+    expect(token.startsWith("f1~")).toBe(true);
+    expect(token.includes(".")).toBe(false);
+    const verified = await verifyFileToken(secret, token, 1_700_000_000_000);
+    expect(verified.ok).toBe(true);
+    if (verified.ok) expect(verified.claims.file_id).toBe("photoBig");
+    expect((await verifyReplyToken(secret, token, 1_700_000_000_000)).ok).toBe(false);
+    const reply = await signReplyToken(secret, claims());
+    expect((await verifyFileToken(secret, reply, 1_700_000_000_000)).ok).toBe(false);
+  });
+
+  it("rejects a file token signed with another secret, a tampered signature, and an expired token", async () => {
+    const token = await signFileToken(secret, fileClaims());
+    expect((await verifyFileToken("other-secret-value", token, 1_700_000_000_000)).ok).toBe(false);
+    const flipped = `${token.slice(0, -1)}${token.endsWith("A") ? "B" : "A"}`;
+    expect(await verifyFileToken(secret, flipped, 1_700_000_000_000)).toEqual({ ok: false, reason: "bad_signature" });
+    const expired = await signFileToken(secret, fileClaims({ exp: 1_600_000_000 }));
+    expect(await verifyFileToken(secret, expired, 1_700_000_000_000)).toEqual({ ok: false, reason: "expired" });
+  });
+
+  it("does not treat a file payload re-prefixed as v1 as a reply token", async () => {
+    const token = await signFileToken(secret, fileClaims());
+    const [, payload, signature] = token.split("~") as [string, string, string];
+    const disguised = `v1.${payload}.${signature}`;
+    expect(await verifyReplyToken(secret, disguised, 1_700_000_000_000)).toEqual({ ok: false, reason: "bad_signature" });
   });
 });
 

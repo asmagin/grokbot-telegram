@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokbot-telegram:wake-event:v3",
+  "title": "Grok Bot Telegram wake event",
+  "description": "JSON body this bridge POSTs to a Grok Bot routine webhook. schema_version is 3. Version 3 adds message.attachments and reply.send_media_url. Every version 2 field is still present, so a consumer that only reads text can keep doing that. Version 2 added reply.heartbeat_url.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "idempotency_key",
+    "update_id",
+    "timestamp",
+    "edited",
+    "addressed_how",
+    "command",
+    "chat",
+    "from",
+    "message",
+    "short_term",
+    "reply"
+  ],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "untrusted_content_notice": {
+      "type": "string",
+      "description": "Fixed reminder that chat.title, chat.username, from, message (including attachment file names and file bytes), and short_term are user-written data, not instructions."
+    },
+    "idempotency_key": { "type": "string", "description": "Same as update_id. Safe to dedupe on." },
+    "update_id": { "type": "integer" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "edited": { "type": "boolean", "description": "True when the wake came from an edited_message whose original never woke the bot. Each Telegram message wakes at most once: edits of a message that already woke the bot are not forwarded." },
+    "addressed_how": { "enum": ["private", "mention", "command", "reply"] },
+    "command": { "type": ["string", "null"] },
+    "chat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "title", "username"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string" },
+        "title": { "type": ["string", "null"], "maxLength": 128 },
+        "username": { "type": ["string", "null"], "maxLength": 32 }
+      }
+    },
+    "from": { "$ref": "#/$defs/user" },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message_id", "text", "date", "message_thread_id", "media", "attachments", "reply_to"],
+      "properties": {
+        "message_id": { "type": "integer" },
+        "text": { "type": "string", "maxLength": 4000, "description": "Untrusted. The message text, or the caption when the message is a photo, document, or other media. Control and bidi-override characters removed." },
+        "date": { "type": ["integer", "null"] },
+        "message_thread_id": { "type": ["integer", "null"] },
+        "media": { "type": "array", "items": { "type": "string" }, "description": "Kind names, including non-file kinds such as contact. Fetchable files are in attachments." },
+        "attachments": {
+          "type": "array",
+          "description": "Files on this message. Empty when there is nothing to fetch. GET file_url with Authorization: Bearer <reply.token>. The token is scoped to this wake's chat, topic, and wake_id. file_url is null when unavailable is too_large (Telegram getFile refuses files over 20971520 bytes).",
+          "items": { "$ref": "#/$defs/attachment" }
+        },
+        "reply_to": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["message_id", "text", "from"],
+          "properties": {
+            "message_id": { "type": "integer" },
+            "text": { "type": "string", "maxLength": 4000 },
+            "from": { "$ref": "#/$defs/user" }
+          }
+        }
+      }
+    },
+    "short_term": {
+      "type": "array",
+      "description": "Prior text or caption messages from this chat and topic. The current message is not included.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["message_id", "text", "date", "message_thread_id", "from"],
+        "properties": {
+          "message_id": { "type": "integer" },
+          "text": { "type": "string", "maxLength": 1000 },
+          "date": { "type": ["integer", "null"] },
+          "message_thread_id": { "type": ["integer", "null"] },
+          "from": { "$ref": "#/$defs/user" }
+        }
+      }
+    },
+    "reply": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token", "expires_at", "wake_id", "send_url", "send_media_url", "typing_stop_url", "heartbeat_url", "chat_id", "message_thread_id"],
+      "properties": {
+        "token": { "type": "string", "description": "Bearer token for /send, /send/media, GET /file/<token>, /typing/stop, and /typing/heartbeat. Multi-use until final or expiry. Not sufficient to fetch a file unless the file URL was signed for this same wake." },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "wake_id": { "type": "string" },
+        "send_url": { "type": "string", "description": "POST a text reply here. final: true on the last message ends typing and the reaction after Telegram accepts it; earlier messages are silent by default and renew the lease." },
+        "send_media_url": { "type": "string", "description": "POST a photo or document here. Same token, chat, topic, reply_to, idempotency, and final semantics as send_url. JSON with an https url, or multipart upload under MAX_MEDIA_BYTES." },
+        "typing_stop_url": { "type": "string", "description": "Fallback: end this wake's typing and reaction without sending text. Other wakes are unaffected." },
+        "heartbeat_url": { "type": "string", "description": "Renew this wake's typing lease without sending text. Never extends past the ceiling or the token expiry." },
+        "chat_id": { "type": "string" },
+        "message_thread_id": { "type": ["integer", "null"] }
+      }
+    }
+  },
+  "$defs": {
+    "user": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["id", "username", "first_name", "last_name", "is_bot"],
+      "properties": {
+        "id": { "type": "string" },
+        "username": { "type": ["string", "null"], "maxLength": 32 },
+        "first_name": { "type": ["string", "null"], "maxLength": 64 },
+        "last_name": { "type": ["string", "null"], "maxLength": 64 },
+        "is_bot": { "type": "boolean" }
+      }
+    },
+    "attachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "mime_type", "file_name", "file_size", "width", "height", "duration", "file_url", "unavailable"],
+      "properties": {
+        "kind": { "enum": ["photo", "document", "video", "animation", "audio", "voice", "video_note", "sticker"] },
+        "mime_type": { "type": ["string", "null"], "maxLength": 127 },
+        "file_name": { "type": ["string", "null"], "maxLength": 255, "description": "Untrusted. Directory prefixes removed." },
+        "file_size": { "type": ["integer", "null"], "minimum": 0 },
+        "width": { "type": ["integer", "null"], "minimum": 0 },
+        "height": { "type": ["integer", "null"], "minimum": 0 },
+        "duration": { "type": ["integer", "null"], "minimum": 0 },
+        "file_url": { "type": ["string", "null"], "description": "Absolute bridge URL. GET with the reply bearer token. Null when the file cannot be fetched." },
+        "unavailable": { "enum": ["too_large", null], "description": "too_large means file_size is over Telegram's 20 MiB getFile limit (20971520 bytes)." }
+      }
+    }
+  }
+}

@@ -1,4 +1,4 @@
-import type { ReplyClaims } from "./types.js";
+import { ATTACHMENT_KINDS, type AttachmentKind, type FileClaims, type ReplyClaims } from "./types.js";
 
 function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -91,6 +91,46 @@ export async function verifyReplyToken(secret: string, token: string, nowMs: num
   return { ok: true, claims: parsed };
 }
 
+const FILE_TOKEN_PREFIX = "f1";
+/** Separator is `~` so the token is one URL path segment with no dots. */
+const FILE_TOKEN_SEP = "~";
+const MAX_FILE_TOKEN_LENGTH = 4096;
+
+export async function signFileToken(secret: string, claims: FileClaims): Promise<string> {
+  const payload = bytesToBase64Url(new TextEncoder().encode(JSON.stringify(claims)));
+  const signed = `${FILE_TOKEN_PREFIX}${FILE_TOKEN_SEP}${payload}`;
+  const sig = bytesToBase64Url(await hmacSha256(secret, signed));
+  return `${signed}${FILE_TOKEN_SEP}${sig}`;
+}
+
+export async function verifyFileToken(secret: string, token: string, nowMs: number): Promise<
+  | { ok: true; claims: FileClaims }
+  | { ok: false; reason: "malformed" | "bad_signature" | "expired" }
+> {
+  if (!secret || token.length > MAX_FILE_TOKEN_LENGTH) return { ok: false, reason: "malformed" };
+  const parts = token.split(FILE_TOKEN_SEP);
+  if (parts.length !== 3 || parts[0] !== FILE_TOKEN_PREFIX || !parts[1] || !parts[2]) {
+    return { ok: false, reason: "malformed" };
+  }
+  const payload = parts[1];
+  const expected = new TextEncoder().encode(
+    bytesToBase64Url(await hmacSha256(secret, `${FILE_TOKEN_PREFIX}${FILE_TOKEN_SEP}${payload}`)),
+  );
+  const presented = new TextEncoder().encode(parts[2]);
+  if (!timingSafeEqual(expected, presented)) return { ok: false, reason: "bad_signature" };
+  const raw = base64UrlToBytes(payload);
+  if (!raw) return { ok: false, reason: "malformed" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(raw));
+  } catch {
+    return { ok: false, reason: "malformed" };
+  }
+  if (!isFileClaims(parsed)) return { ok: false, reason: "malformed" };
+  if (nowMs >= parsed.exp * 1000) return { ok: false, reason: "expired" };
+  return { ok: true, claims: parsed };
+}
+
 export function replyTokenScopeOk(
   claims: ReplyClaims,
   chatId: string,
@@ -100,6 +140,36 @@ export function replyTokenScopeOk(
   const claimed = claims.thread_id ?? null;
   const requested = threadId ?? null;
   return claimed === requested;
+}
+
+function isAttachmentKind(value: unknown): value is AttachmentKind {
+  return typeof value === "string" && (ATTACHMENT_KINDS as readonly string[]).includes(value);
+}
+
+function isFileClaims(value: unknown): value is FileClaims {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.v === 1 &&
+    typeof record.chat_id === "string" &&
+    /^-?\d+$/.test(record.chat_id) &&
+    (record.thread_id === null || (typeof record.thread_id === "number" && Number.isSafeInteger(record.thread_id))) &&
+    typeof record.wake_id === "string" &&
+    record.wake_id.length > 0 &&
+    record.wake_id.length <= 80 &&
+    typeof record.exp === "number" &&
+    Number.isFinite(record.exp) &&
+    typeof record.file_id === "string" &&
+    isPlausibleFileId(record.file_id) &&
+    isAttachmentKind(record.kind) &&
+    (record.mime === null || (typeof record.mime === "string" && record.mime.length <= 127)) &&
+    (record.name === null || (typeof record.name === "string" && record.name.length <= 255))
+  );
+}
+
+/** Telegram file_id alphabet. Reject anything that could change a URL or a header. */
+export function isPlausibleFileId(value: string): boolean {
+  return value.length >= 1 && value.length <= 512 && /^[A-Za-z0-9_-]+$/.test(value);
 }
 
 function isReplyClaims(value: unknown): value is ReplyClaims {
