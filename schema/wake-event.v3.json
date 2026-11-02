@@ -117,7 +117,7 @@
         "expires_at": { "type": "string", "format": "date-time" },
         "wake_id": { "type": "string" },
         "send_url": { "type": "string", "description": "POST a text reply here. The 200 body includes message_ids, the Telegram ids created. final: true on the last message ends typing and the reaction after Telegram accepts it; earlier messages are silent by default and renew the lease. Pass one of those ids to edit_url to update that bubble in place." },
-        "send_media_url": { "type": "string", "description": "POST a photo or document here. Same token, chat, topic, reply_to, idempotency, and final semantics as send_url. JSON with an https url, or multipart upload under MAX_MEDIA_BYTES." },
+        "send_media_url": { "type": "string", "description": "POST a photo, document, voice note, or audio file here. Same token, chat, topic, reply_to, idempotency, and final semantics as send_url. JSON with an https url, or multipart upload under MAX_MEDIA_BYTES." },
         "edit_url": { "type": "string", "description": "POST here to replace the text of a message this wake already sent through send_url. Body includes message_id from that send's message_ids. The bridge allows only those ids. final: true uses the same one-final slot as send_url and ends typing and the reaction. A final answer longer than 4096 characters is split: the first part replaces this message and the rest are new messages. Telegram's 'message is not modified' is success." },
         "typing_stop_url": { "type": "string", "description": "Fallback: end this wake's typing and reaction without sending text. Other wakes are unaffected." },
         "heartbeat_url": { "type": "string", "description": "Renew this wake's typing lease without sending text. Never extends past the ceiling or the token expiry." },
@@ -301,7 +301,10 @@
         "height": { "type": ["integer", "null"], "minimum": 0 },
         "duration": { "type": ["integer", "null"], "minimum": 0 },
         "file_url": { "type": ["string", "null"], "description": "Absolute bridge URL. GET with the reply bearer token. Null when the file cannot be fetched." },
-        "unavailable": { "enum": ["too_large", null], "description": "too_large means file_size is over Telegram's 20 MiB getFile limit (20971520 bytes)." }
+        "unavailable": { "enum": ["too_large", null], "description": "too_large means file_size is over Telegram's 20 MiB getFile limit (20971520 bytes)." },
+        "transcript": { "type": ["string", "null"], "maxLength": 4000, "description": "Untrusted. Present only when speech transcription is enabled and kind is voice, audio, or video_note. The transcript, or null when transcription produced no text. Omitted when transcription is off, and omitted on other kinds." },
+        "transcript_language": { "type": ["string", "null"], "maxLength": 32, "description": "Language the provider reported for this transcript, when it reported one (a BCP-47 code such as en or es-mx). Null when unknown. Omitted when transcript is omitted." },
+        "transcript_error": { "enum": ["too_long", "too_large", "unavailable", "fetch_failed", "provider_error", "timeout", "empty", "unsupported", null], "description": "Why transcript is null. Null when a transcript is present. Omitted when transcription is off." }
       }
     }
   }

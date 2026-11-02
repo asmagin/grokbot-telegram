@@ -5,6 +5,7 @@ import {
   type AttachmentKind,
   type FileClaims,
   type TelegramMessage,
+  type TranscriptFields,
   type WakeAttachment,
 } from "./types.js";
 
@@ -142,6 +143,34 @@ function collect(message: TelegramMessage): { kind: AttachmentKind; file: Parsed
   return found;
 }
 
+const SPEECH_KINDS = new Set<AttachmentKind>(["voice", "audio", "video_note"]);
+
+export interface SpeechFile {
+  fileId: string;
+  kind: "voice" | "audio" | "video_note";
+  mime: string | null;
+  fileName: string | null;
+  fileSize: number | null;
+  duration: number | null;
+}
+
+/** Voice, audio, and video notes on this message, in attachment order. */
+export function listSpeechFiles(message: TelegramMessage): SpeechFile[] {
+  const files: SpeechFile[] = [];
+  for (const item of collect(message)) {
+    if (item.kind !== "voice" && item.kind !== "audio" && item.kind !== "video_note") continue;
+    files.push({
+      fileId: item.file.file_id,
+      kind: item.kind,
+      mime: defaultMime(item.kind, item.file),
+      fileName: item.file.file_name,
+      fileSize: item.file.file_size,
+      duration: item.file.duration,
+    });
+  }
+  return files;
+}
+
 export async function describeAttachments(
   message: TelegramMessage,
   options: {
@@ -152,6 +181,8 @@ export async function describeAttachments(
     threadId: number | null;
     wakeId: string;
     expSeconds: number;
+    /** When set, speech attachments gain transcript fields. Omit to leave them unchanged. */
+    transcripts?: ReadonlyMap<string, TranscriptFields>;
   },
 ): Promise<WakeAttachment[]> {
   const attachments: WakeAttachment[] = [];
@@ -175,7 +206,7 @@ export async function describeAttachments(
       const token = await signFileToken(options.secret, claims);
       fileUrl = joinUrl(options.publicBaseUrl, options.pathPrefix, `/file/${token}`);
     }
-    attachments.push({
+    const attachment: WakeAttachment = {
       kind: item.kind,
       mime_type: mime,
       file_name: name,
@@ -185,7 +216,18 @@ export async function describeAttachments(
       duration: item.file.duration,
       file_url: fileUrl,
       unavailable: tooLarge ? "too_large" : null,
-    });
+    };
+    if (options.transcripts && SPEECH_KINDS.has(item.kind)) {
+      const fields = options.transcripts.get(item.file.file_id) ?? {
+        transcript: null,
+        transcript_language: null,
+        transcript_error: "provider_error" as const,
+      };
+      attachment.transcript = fields.transcript;
+      attachment.transcript_language = fields.transcript_language;
+      attachment.transcript_error = fields.transcript_error;
+    }
+    attachments.push(attachment);
   }
   return attachments;
 }

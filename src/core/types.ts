@@ -7,8 +7,35 @@ export const TELEGRAM_TEXT_LIMIT = 4096;
 /** Telegram Bot API getFile refuses anything larger than 20 MiB. */
 export const TELEGRAM_GET_FILE_MAX_BYTES = 20 * 1024 * 1024;
 
-/** Caption limit for sendPhoto and sendDocument. */
+/** Caption limit for sendPhoto, sendDocument, sendVoice, and sendAudio. */
 export const TELEGRAM_CAPTION_LIMIT = 1024;
+
+/**
+ * Why a speech attachment has no transcript. Present only when transcription
+ * ran. `unavailable` is Telegram's own getFile limit; `too_large` and
+ * `too_long` are this bridge's caps.
+ */
+export const TRANSCRIPT_ERRORS = [
+  "too_long",
+  "too_large",
+  "unavailable",
+  "fetch_failed",
+  "provider_error",
+  "timeout",
+  "empty",
+  "unsupported",
+] as const;
+
+export type TranscriptError = (typeof TRANSCRIPT_ERRORS)[number];
+
+export interface TranscriptFields {
+  /** Untrusted speech-to-text text, cleaned like message text. Null when transcription produced none. */
+  transcript: string | null;
+  /** Provider language, when it reported one. Null when unknown or when there is no transcript. */
+  transcript_language: string | null;
+  /** Null when `transcript` is text. A reason when it is null. */
+  transcript_error: TranscriptError | null;
+}
 
 export const ATTACHMENT_KINDS = [
   "photo",
@@ -23,7 +50,7 @@ export const ATTACHMENT_KINDS = [
 
 export type AttachmentKind = (typeof ATTACHMENT_KINDS)[number];
 
-export type SendMediaKind = "photo" | "document";
+export type SendMediaKind = "photo" | "document" | "voice" | "audio";
 
 export const DEFAULT_WAKE_COMMANDS = ["ask", "help"] as const;
 
@@ -291,6 +318,14 @@ export interface WakeAttachment {
   duration: number | null;
   file_url: string | null;
   unavailable: "too_large" | null;
+  /**
+   * Set only when transcription is enabled and `kind` is voice, audio, or
+   * video_note. Omitted entirely when transcription is off, so older consumers
+   * see the same attachment shape as before.
+   */
+  transcript?: string | null;
+  transcript_language?: string | null;
+  transcript_error?: TranscriptError | null;
 }
 
 /** Signed into the file URL. Not a reply token: the prefix is `f1`, not `v1`. */

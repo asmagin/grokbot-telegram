@@ -34,7 +34,7 @@ export interface TelegramClient {
    * already had that text (`message is not modified`), which is success.
    */
   editMessageText(input: { chat_id: string; message_id: number; text: string }): Promise<SendMessageResult>;
-  /** One photo or document. `url` is fetched by Telegram. `file` is uploaded by the bridge. */
+  /** One photo, document, voice note, or audio file. `url` is fetched by Telegram. `file` is uploaded by the bridge. */
   sendMedia(input: SendMediaInput): Promise<SendMessageResult>;
   /** Bot API getFile. Does not download bytes. */
   getFile(fileId: string): Promise<GetFileResult>;
@@ -42,7 +42,7 @@ export interface TelegramClient {
    * Stream a file Telegram already described. The URL contains the bot token
    * and must never be returned, logged, or followed across a redirect.
    */
-  downloadFile(filePath: string): Promise<DownloadResult>;
+  downloadFile(filePath: string, timeoutMs?: number): Promise<DownloadResult>;
   sendChatAction(input: {
     chat_id: string;
     message_thread_id?: number;
@@ -91,7 +91,7 @@ export type GetFileResult =
 
 export type DownloadResult =
   | { ok: true; body: ReadableStream<Uint8Array>; contentLength: number | null }
-  | { ok: false; description: string; status: number; tooLarge?: boolean };
+  | { ok: false; description: string; status: number; tooLarge?: boolean; timeout?: boolean };
 
 /** Telegram returns this when editMessageText is asked to write the text it already has. */
 export function isNotModified(description: string): boolean {
@@ -109,6 +109,32 @@ export function telegramFileUrl(token: string, filePath: string): string | null 
   if (!isPlausibleBotToken(token)) return null;
   if (!isSafeTelegramFilePath(filePath)) return null;
   return `https://api.telegram.org/file/bot${token}/${filePath}`;
+}
+
+function mediaMethod(kind: SendMediaKind): string {
+  switch (kind) {
+    case "photo":
+      return "sendPhoto";
+    case "voice":
+      return "sendVoice";
+    case "audio":
+      return "sendAudio";
+    case "document":
+      return "sendDocument";
+  }
+}
+
+function mediaField(kind: SendMediaKind): string {
+  switch (kind) {
+    case "photo":
+      return "photo";
+    case "voice":
+      return "voice";
+    case "audio":
+      return "audio";
+    case "document":
+      return "document";
+  }
 }
 
 interface TelegramOk {
@@ -254,8 +280,8 @@ export function createTelegramClient(options: {
       return result;
     },
     async sendMedia(input) {
-      const method = input.kind === "photo" ? "sendPhoto" : "sendDocument";
-      const field = input.kind === "photo" ? "photo" : "document";
+      const method = mediaMethod(input.kind);
+      const field = mediaField(input.kind);
       const extra = replyFields(input);
       if (input.file) {
         const file = input.file;
@@ -302,14 +328,14 @@ export function createTelegramClient(options: {
         ...(tooLarge ? { tooLarge: true } : {}),
       };
     },
-    async downloadFile(filePath) {
+    async downloadFile(filePath, timeoutMs = 50_000) {
       const url = telegramFileUrl(options.token, filePath);
       if (!url) return { ok: false, description: "bad_file_path", status: 0 };
       try {
         const response = await fetchImpl(url, {
           method: "GET",
           redirect: "manual",
-          signal: AbortSignal.timeout(50_000),
+          signal: AbortSignal.timeout(timeoutMs),
         });
         if (response.status >= 300 && response.status < 400) {
           await response.body?.cancel().catch(() => undefined);
@@ -326,8 +352,14 @@ export function createTelegramClient(options: {
           return { ok: false, description: "file_too_large", status: 413, tooLarge: true };
         }
         return { ok: true, body: response.body, contentLength };
-      } catch {
-        return { ok: false, description: "telegram_unreachable", status: 0 };
+      } catch (err) {
+        const timeout = err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError");
+        return {
+          ok: false,
+          description: timeout ? "timeout" : "telegram_unreachable",
+          status: 0,
+          ...(timeout ? { timeout: true } : {}),
+        };
       }
     },
     async sendChatAction(input) {

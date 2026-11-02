@@ -166,6 +166,7 @@ describe("incoming attachments", () => {
       ["video_note", "video/mp4", 2],
       ["sticker", "image/webp", null],
     ]);
+    expect(payload.message.attachments[0]).not.toHaveProperty("transcript");
     expect(payload.message.attachments[0]?.file_url).toMatch(/^https:\/\/bridge\.example\/bridge\/file\/f1~/);
     const fetched = await handleRequest(new Request(payload.message.attachments[0]!.file_url!, {
       headers: { authorization: `Bearer ${payload.reply.token}` },

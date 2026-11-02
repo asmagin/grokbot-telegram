@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { canonicalId, fatalConfigProblems, loadConfig, normalizePublicBaseUrl } from "../src/core/config.js";
+import {
+  DEFAULT_TRANSCRIBE_MAX_BYTES,
+  DEFAULT_TRANSCRIBE_MAX_SECONDS,
+  canonicalId,
+  fatalConfigProblems,
+  loadConfig,
+  normalizePublicBaseUrl,
+} from "../src/core/config.js";
 import { handleRequest } from "../src/core/handler.js";
 import { createTestApp, dmUpdate, postUpdate, testEnv } from "./helpers.js";
 
@@ -83,6 +90,36 @@ describe("public base url", () => {
     await postUpdate(app.deps, app.tasks, dmUpdate("hello"));
     expect(grokCalls(app.calls)).toBe(0);
     expect(app.deps.config.problems).toContain("PUBLIC_BASE_URL");
+  });
+});
+
+describe("speech transcription config", () => {
+  it("stays off when the xAI key is unset, even if the caps are set", () => {
+    const config = loadConfig(testEnv({ TRANSCRIBE_MAX_SECONDS: "30", TRANSCRIBE_MAX_BYTES: "1000" }));
+    expect(config.speech).toBeNull();
+    expect(config.problems).not.toContain("XAI_API_KEY");
+  });
+
+  it("turns on with the key and uses the default caps", () => {
+    const config = loadConfig(testEnv({ XAI_API_KEY: "xai-test-api-key-0123456789" }));
+    expect(config.speech).toEqual({
+      apiKey: "xai-test-api-key-0123456789",
+      maxSeconds: DEFAULT_TRANSCRIBE_MAX_SECONDS,
+      maxBytes: DEFAULT_TRANSCRIBE_MAX_BYTES,
+    });
+    expect(config.problems).toEqual([]);
+  });
+
+  it("rejects a short key by name and clamps the caps", () => {
+    const short = loadConfig(testEnv({ XAI_API_KEY: "xai-short" }));
+    expect(short.speech).toBeNull();
+    expect(short.problems).toContain("XAI_API_KEY");
+    const clamped = loadConfig(testEnv({
+      XAI_API_KEY: "xai-test-api-key-0123456789",
+      TRANSCRIBE_MAX_SECONDS: "9999",
+      TRANSCRIBE_MAX_BYTES: "9",
+    }));
+    expect(clamped.speech).toMatchObject({ maxSeconds: 180, maxBytes: 1024 });
   });
 });
 
