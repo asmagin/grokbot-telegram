@@ -1,9 +1,9 @@
 import { setWebhookBody } from "../src/core/commands.js";
 import { isValidWebhookSecret, loadConfig } from "../src/core/config.js";
 import { joinUrl } from "../src/core/text.js";
-import { requireEnv, telegramCall } from "./telegram-call.js";
+import { requireEnv, selectedEnv, telegramCall } from "./telegram-call.js";
 
-const config = loadConfig(process.env);
+const config = loadConfig(selectedEnv);
 requireEnv("PUBLIC_BASE_URL");
 requireEnv("TELEGRAM_WEBHOOK_SECRET");
 if (!config.publicBaseUrl) {

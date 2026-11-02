@@ -1,7 +1,23 @@
+import { loadBots } from "../src/core/bots.js";
+
+export const selectedEnv = (() => {
+  try {
+    const bots = loadBots(process.env);
+    const index = process.argv.indexOf("--bot");
+    const id = index >= 0 ? process.argv[index + 1] : null;
+    const bot = bots.find((entry) => entry.id === id);
+    if (!bot) throw new Error("selection_required");
+    return bot.env;
+  } catch {
+    console.error("Invalid bot configuration or selection. Use --bot <name> in multi-bot mode.");
+    process.exit(1);
+  }
+})();
+
 import { telegramMethodUrl } from "../src/core/telegram.js";
 
 export function requireEnv(name: string): string {
-  const value = process.env[name]?.trim() ?? "";
+  const value = selectedEnv[name]?.trim() ?? "";
   if (!value) {
     console.error(JSON.stringify({ ok: false, error: "missing_env", name }));
     process.exit(1);

@@ -71,7 +71,17 @@ function chatObjectName(chatId: string): string {
   return `chat:${chatId}`;
 }
 
-export function createDurableBackend(namespace: DoNamespace): { store: Store; typing: TypingController } {
+export function createDurableBackend(original: DoNamespace, botId: string | null = null): { store: Store; typing: TypingController } {
+  const namespace: DoNamespace = botId === null ? original : {
+    idFromName: (name) => original.idFromName(`bot:${botId}:${name}`),
+    get: (id) => ({
+      async fetch(input, init) {
+        const request = new Request(input, init);
+        request.headers.set("x-bridge-bot", botId);
+        return original.get(id).fetch(request);
+      },
+    }),
+  };
   const store: Store = {
     async claimUpdate(updateId, now, ttlMs) {
       const result = await call(namespace, "dedupe", { op: "claim", updateId, now, ttlMs });

@@ -1,3 +1,4 @@
+import { botsHealth, loadBots, selectBot } from "../../core/bots.js";
 import { buildDeps } from "../../core/deps.js";
 import { handleHealth, handleRequest } from "../../core/handler.js";
 import { json } from "../../core/http.js";
@@ -23,7 +24,18 @@ function stringEnv(env: CfEnv): Record<string, string | undefined> {
 }
 
 export async function handleCloudflare(request: Request, env: CfEnv, ctx: CfContext): Promise<Response> {
-  const record = stringEnv(env);
+  let bot;
+  try {
+    const bots = loadBots(stringEnv(env));
+    const pathname = new URL(request.url).pathname;
+    const health = botsHealth(request.method, pathname, bots, env);
+    if (health) return health;
+    bot = selectBot(bots, pathname);
+  } catch {
+    return json(503, { ok: false, error: "bot_configuration_invalid" });
+  }
+  if (!bot) return json(404, { ok: false, error: "not_found" });
+  const record = bot.env;
   const waitUntil = (promise: Promise<unknown>) => ctx.waitUntil(promise);
   if (!env.CHAT_SESSION) {
     const deps = buildDeps({ env: record, typingMode: "once", waitUntil });
@@ -33,7 +45,7 @@ export async function handleCloudflare(request: Request, env: CfEnv, ctx: CfCont
     }
     return json(503, { ok: false, error: "durable_object_not_configured" });
   }
-  const backend = createDurableBackend(env.CHAT_SESSION);
+  const backend = createDurableBackend(env.CHAT_SESSION, bot.id);
   const deps = buildDeps({
     env: record,
     store: backend.store,

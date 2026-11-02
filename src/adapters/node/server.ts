@@ -1,3 +1,5 @@
+import { botsHealth, loadBots, selectBot } from "../../core/bots.js";
+import { json } from "../../core/http.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 import { fatalConfigProblems, loadConfig } from "../../core/config.js";
@@ -64,8 +66,9 @@ export async function startNodeServer(options: {
   typingMode?: "interval" | "once";
 }): Promise<NodeServer> {
   const pending = new Set<Promise<unknown>>();
-  const deps = options.deps ?? buildDeps({
-    env: options.env,
+  const bots = options.deps ? [{ id: null, env: options.env }] : loadBots(options.env);
+  const apps = new Map(bots.map((bot) => [bot, options.deps ?? buildDeps({
+    env: bot.env,
     typingMode: options.typingMode ?? "interval",
     fetchImpl: options.fetchImpl,
     now: options.now,
@@ -73,9 +76,18 @@ export async function startNodeServer(options: {
       pending.add(promise);
       promise.finally(() => pending.delete(promise)).catch(() => undefined);
     },
-  });
+  })]));
   const server = createServer(async (req, res) => {
     try {
+      const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+      const health = botsHealth(req.method ?? "GET", pathname, bots, options.env);
+      if (health) { await writeNodeResponse(res, health); return; }
+      const bot = selectBot(bots, pathname);
+      const deps = bot ? apps.get(bot) : undefined;
+      if (!deps) {
+        await writeNodeResponse(res, json(404, { ok: false, error: "not_found" }));
+        return;
+      }
       const request = await nodeRequestToWeb(req, routeBodyLimit(req.url ?? "/", deps.config));
       const response = await handleRequest(request, deps);
       await writeNodeResponse(res, response);
@@ -127,8 +139,13 @@ const isMain = entry.length > 0 && (
 );
 if (isMain) {
   const port = Number(process.env.PORT ?? 8080);
+  let bots;
+  try { bots = loadBots(process.env); } catch {
+    console.error("invalid_TELEGRAM_BOTS");
+    process.exit(1);
+  }
   const config = loadConfig(process.env);
-  const fatal = fatalConfigProblems(config);
+  const fatal = bots.flatMap((bot) => fatalConfigProblems(loadConfig(bot.env)));
   if (config.problems.length > 0) {
     console.error(JSON.stringify({ event: "config_problems", settings: config.problems }));
   }

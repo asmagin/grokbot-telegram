@@ -1,3 +1,5 @@
+import { botsHealth, loadBots, selectBot } from "../../core/bots.js";
+import { json } from "../../core/http.js";
 import { waitUntil } from "@vercel/functions";
 import { buildDeps, type AppDeps } from "../../core/deps.js";
 import { handleRequest } from "../../core/handler.js";
@@ -7,6 +9,7 @@ import { createLogger } from "../../core/log.js";
 import { createStoreTyping, telegramEffects, type TypingController } from "../../core/typing.js";
 
 interface Shared {
+  bots?: Map<string, Shared>;
   store?: Store;
   typing?: TypingController;
 }
@@ -15,6 +18,7 @@ const shared: Shared = {};
 
 /** Test hook. Production instances keep the store for the life of the isolate. */
 export function resetVercelShared(): void {
+  shared.bots = undefined;
   shared.store = undefined;
   shared.typing = undefined;
 }
@@ -71,7 +75,22 @@ export async function vercelFetch(
 ): Promise<Response> {
   const url = new URL(request.url);
   url.pathname = url.searchParams.get("path") ?? url.pathname;
-  return handleRequest(new Request(url, request), createVercelDeps(env, state, fetchImpl));
+  try {
+    const bots = loadBots(env);
+    const health = botsHealth(request.method, url.pathname, bots, env);
+    if (health) return health;
+    const bot = selectBot(bots, url.pathname);
+    if (!bot) return json(404, { ok: false, error: "not_found" });
+    let selected = state;
+    if (bot.id !== null) {
+      state.bots ??= new Map();
+      selected = state.bots.get(bot.id) ?? {};
+      state.bots.set(bot.id, selected);
+    }
+    return handleRequest(new Request(url, request), createVercelDeps(bot.env, selected, fetchImpl));
+  } catch {
+    return json(503, { ok: false, error: "bot_configuration_invalid" });
+  }
 }
 
 function envRecord(env: NodeJS.ProcessEnv): Record<string, string | undefined> {

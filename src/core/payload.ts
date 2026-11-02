@@ -220,7 +220,7 @@ export async function buildWakeEvent(options: {
   return {
     schema_version: SCHEMA_VERSION,
     untrusted_content_notice: UNTRUSTED_CONTENT_NOTICE,
-    idempotency_key: String(options.updateId),
+    idempotency_key: options.config.botName ? `${options.config.botName}:${options.updateId}` : String(options.updateId),
     update_id: options.updateId,
     timestamp: new Date(options.nowMs).toISOString(),
     edited: options.edited,
@@ -276,7 +276,7 @@ export async function buildCallbackWakeEvent(options: {
   return {
     schema_version: SCHEMA_VERSION,
     untrusted_content_notice: UNTRUSTED_CONTENT_NOTICE,
-    idempotency_key: String(options.updateId),
+    idempotency_key: options.config.botName ? `${options.config.botName}:${options.updateId}` : String(options.updateId),
     update_id: options.updateId,
     timestamp: new Date(options.nowMs).toISOString(),
     edited: false,
