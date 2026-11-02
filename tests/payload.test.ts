@@ -60,5 +60,7 @@ describe("wake schema file", () => {
     expect(schema.properties.schema_version.const).toBe(payload.schema_version);
     expect(Object.keys(payload).filter((key) => key !== "untrusted_content_notice").sort()).toEqual([...schema.required].sort());
     expect(Object.keys(payload.reply).sort()).toEqual([...schema.properties.reply.required].sort());
+    const messageRequired = (schema.properties as { message?: { required?: string[] } }).message?.required ?? [];
+    expect(Object.keys(payload.message).sort()).toEqual([...messageRequired].sort());
   });
 });

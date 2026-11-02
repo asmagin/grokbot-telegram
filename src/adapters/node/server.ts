@@ -3,6 +3,7 @@ import { pathToFileURL } from "node:url";
 import { fatalConfigProblems, loadConfig } from "../../core/config.js";
 import { buildDeps, type AppDeps } from "../../core/deps.js";
 import { handleRequest } from "../../core/handler.js";
+import { routeBodyLimit } from "../../core/http.js";
 
 export class BodyTooLargeError extends Error {
   constructor() {
@@ -75,7 +76,7 @@ export async function startNodeServer(options: {
   });
   const server = createServer(async (req, res) => {
     try {
-      const request = await nodeRequestToWeb(req, deps.config.maxBodyBytes);
+      const request = await nodeRequestToWeb(req, routeBodyLimit(req.url ?? "/", deps.config));
       const response = await handleRequest(request, deps);
       await writeNodeResponse(res, response);
     } catch (err) {
@@ -94,7 +95,8 @@ export async function startNodeServer(options: {
     }
   });
   // Slow-body clients should not hold sockets open for Node's 300 s default.
-  server.requestTimeout = 30_000;
+  // Long enough for a proxied Telegram file (up to 20 MiB) and still well under Node's 300 s default.
+  server.requestTimeout = 60_000;
   server.headersTimeout = 15_000;
   const host = options.host ?? "127.0.0.1";
   await new Promise<void>((resolve) => server.listen(options.port ?? 0, host, () => resolve()));

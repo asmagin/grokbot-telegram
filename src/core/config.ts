@@ -33,6 +33,8 @@ export interface Config {
   fastGreeting: boolean;
   outboundApiKey: string | null;
   maxBodyBytes: number;
+  /** Cap for a multipart upload to /send/media. Stays under Vercel's ~4.5 MB body limit. */
+  maxMediaBytes: number;
   dedupeTtlMs: number;
   allowInsecureWebhook: boolean;
   /** Names of settings that were present but rejected. Never contains values. */
@@ -218,6 +220,8 @@ export function loadConfig(env: EnvSource): Config {
     fastGreeting: readBool(env, "FAST_GREETING"),
     outboundApiKey: outbound.length >= MIN_OUTBOUND_KEY_LENGTH ? outbound : null,
     maxBodyBytes: Math.max(1024, readInt(env, "MAX_BODY_BYTES", 1_000_000)),
+    // 4_000_000 leaves room under Vercel's ~4.5 MB platform body limit. Hard cap 4 MiB.
+    maxMediaBytes: Math.min(4_194_304, Math.max(1024, readInt(env, "MAX_MEDIA_BYTES", 4_000_000))),
     dedupeTtlMs: Math.max(1000, readInt(env, "DEDUPE_TTL_MS", 86_400_000)),
     allowInsecureWebhook,
     problems,

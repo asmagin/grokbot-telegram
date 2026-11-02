@@ -9,10 +9,10 @@ export function json(status: number, body: unknown, extraHeaders?: Record<string
   });
 }
 
-export async function readLimitedBody(
+export async function readLimitedBytes(
   request: Request,
   maxBytes: number,
-): Promise<{ ok: true; text: string } | { ok: false; response: Response }> {
+): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; response: Response }> {
   const declared = request.headers.get("content-length");
   if (declared) {
     const length = Number(declared);
@@ -23,7 +23,7 @@ export async function readLimitedBody(
   // Content-Length can be absent (chunked) or wrong, so count while streaming
   // and stop reading as soon as the cap is passed.
   const tooLarge = { ok: false as const, response: json(413, { ok: false, error: "body_too_large" }) };
-  if (!request.body) return { ok: true, text: "" };
+  if (!request.body) return { ok: true, bytes: new Uint8Array() };
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -43,7 +43,27 @@ export async function readLimitedBody(
     buffer.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return { ok: true, text: new TextDecoder().decode(buffer) };
+  return { ok: true, bytes: buffer };
+}
+
+export async function readLimitedBody(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; text: string } | { ok: false; response: Response }> {
+  const read = await readLimitedBytes(request, maxBytes);
+  if (!read.ok) return read;
+  return { ok: true, text: new TextDecoder().decode(read.bytes) };
+}
+
+/** `/send/media` may carry a small upload. Every other route keeps the JSON cap. */
+export function routeBodyLimit(
+  rawUrl: string,
+  config: { maxBodyBytes: number; maxMediaBytes: number; pathPrefix: string },
+): number {
+  const pathOnly = rawUrl.split("?")[0] ?? "/";
+  const route = routePath(new URL(pathOnly, "http://localhost"), config.pathPrefix);
+  if (route === "/send/media") return Math.max(config.maxBodyBytes, config.maxMediaBytes);
+  return config.maxBodyBytes;
 }
 
 /**

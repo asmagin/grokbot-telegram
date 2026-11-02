@@ -17,7 +17,7 @@ When a Telegram wake arrives as a `<webhook_event>`, follow [`.grok/skills/teleg
 - Cloudflare Workers is the primary host (`wrangler.toml`, Durable Object `ChatSession`). Vercel is `api/index.ts` plus `vercel.json`. Node is `npm start`. Vercel and Node keep state in `MemoryStore`.
 - Register the webhook once with `npm run set-webhook`, outside process startup.
 - Tests are Vitest. `npm test`, `npm run typecheck`, and `npm run lint` pass.
-- Wake payload schema version is 2 (`schema/wake-event.v2.json`). Version 2 added `reply.heartbeat_url`.
+- Wake payload schema version is 3 (`schema/wake-event.v3.json`). Version 3 adds `message.attachments` and `reply.send_media_url`. Version 2 added `reply.heartbeat_url`. Text `/send` is unchanged. Incoming files are fetched with `GET` on the attachment `file_url` and the reply token. Photos and documents go out through `POST /send/media`.
 - By default, an empty allowlist denies everyone. `BRIDGE_ACK` and `FAST_GREETING` are off, so the 👀 and typing are the acknowledgement and every greeting wakes the assistant.
 - Progress feedback is a 👀 reaction plus typing per wake: a per-chat set of active wakes, refreshed every 3 s. A wake ends on a delivered `final: true` send, `/typing/stop` for that wake, lease expiry, or a definitely failed forward. An ambiguous forward, such as a timeout, logs `forward_ambiguous` and keeps the wake open. The bridge sends each forward once. Interim sends are silent and re-pulse typing. The sendMessageDraft placeholder is behind `TELEGRAM_DRAFT_PLACEHOLDER` (off).
 

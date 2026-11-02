@@ -1,8 +1,29 @@
-export const SCHEMA_VERSION = 2 as const;
+export const SCHEMA_VERSION = 3 as const;
 
 export const TELEGRAM_SECRET_HEADER = "x-telegram-bot-api-secret-token";
 
 export const TELEGRAM_TEXT_LIMIT = 4096;
+
+/** Telegram Bot API getFile refuses anything larger than 20 MiB. */
+export const TELEGRAM_GET_FILE_MAX_BYTES = 20 * 1024 * 1024;
+
+/** Caption limit for sendPhoto and sendDocument. */
+export const TELEGRAM_CAPTION_LIMIT = 1024;
+
+export const ATTACHMENT_KINDS = [
+  "photo",
+  "document",
+  "video",
+  "animation",
+  "audio",
+  "voice",
+  "video_note",
+  "sticker",
+] as const;
+
+export type AttachmentKind = (typeof ATTACHMENT_KINDS)[number];
+
+export type SendMediaKind = "photo" | "document";
 
 export const DEFAULT_WAKE_COMMANDS = ["ask", "help"] as const;
 
@@ -103,10 +124,41 @@ export interface WakeReply {
   expires_at: string;
   wake_id: string;
   send_url: string;
+  send_media_url: string;
   typing_stop_url: string;
   heartbeat_url: string;
   chat_id: string;
   message_thread_id: number | null;
+}
+
+/**
+ * A file on the waking message. `file_url` is a bridge URL. GET it with
+ * `Authorization: Bearer <reply.token>`. The bot token stays on the bridge.
+ * `unavailable: "too_large"` means Telegram's getFile limit (20 MiB).
+ */
+export interface WakeAttachment {
+  kind: AttachmentKind;
+  mime_type: string | null;
+  file_name: string | null;
+  file_size: number | null;
+  width: number | null;
+  height: number | null;
+  duration: number | null;
+  file_url: string | null;
+  unavailable: "too_large" | null;
+}
+
+/** Signed into the file URL. Not a reply token: the prefix is `f1`, not `v1`. */
+export interface FileClaims {
+  v: 1;
+  chat_id: string;
+  thread_id: number | null;
+  wake_id: string;
+  file_id: string;
+  exp: number;
+  kind: AttachmentKind;
+  mime: string | null;
+  name: string | null;
 }
 
 export interface WakeEvent {
@@ -131,6 +183,7 @@ export interface WakeEvent {
     date: number | null;
     message_thread_id: number | null;
     media: string[];
+    attachments: WakeAttachment[];
     reply_to: ReplyTo | null;
   };
   short_term: ContextMessage[];

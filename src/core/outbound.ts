@@ -2,10 +2,12 @@ import { isOutboundChatAllowed } from "./allowlist.js";
 import { canonicalId } from "./config.js";
 import { replyTokenScopeOk, secretsEqual, verifyReplyToken } from "./crypto.js";
 import type { AppDeps } from "./deps.js";
-import { json, readLimitedBody } from "./http.js";
+import { json, readLimitedBody, readLimitedBytes } from "./http.js";
+import { cleanFileName, normalizePublicMediaUrl } from "./media.js";
 import { scopeKey, type SendRecord } from "./store.js";
+import type { SendMessageResult } from "./telegram.js";
 import { splitTelegramText } from "./text.js";
-import { TELEGRAM_TEXT_LIMIT, type ReplyClaims } from "./types.js";
+import { TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT, type ReplyClaims, type SendMediaKind } from "./types.js";
 
 const MAX_TEXT_CHARS = TELEGRAM_TEXT_LIMIT * 8;
 
@@ -48,18 +50,8 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
 
   const auth = await authorize(credential, deps, chatId, threadId, { allowClosed: true });
   if (!auth.ok) return auth.response;
-
-  // One final per wake, and at most one delivery per idempotency_key. Held for the token's life.
-  const sendKey = auth.wakeId
-    ? final ? `${auth.wakeId}:final` : idempotencyKey ? `${auth.wakeId}:key:${idempotencyKey}` : null
-    : idempotencyKey ? `outbound:${chatId}:${idempotencyKey}` : null;
-  const sendTtlMs = auth.wakeId ? Math.max(1000, auth.expiresAtMs - deps.now()) : deps.config.dedupeTtlMs;
-  const existing = sendKey ? await deps.store.claimSend(sendKey, deps.now(), sendTtlMs) : null;
-  if (existing) return repeatedSend(deps, chatId, auth.wakeId, existing);
-  if (auth.closed) {
-    if (sendKey) await deps.store.releaseSend(sendKey);
-    return json(401, { ok: false, error: "wake_closed" });
-  }
+  const reserved = await reserveSend(deps, auth, chatId, final, idempotencyKey);
+  if (!reserved.ok) return reserved.response;
 
   // A progress line inside a wake goes out silently; the final answer notifies.
   // Operator sends (OUTBOUND_API_KEY, no wake) notify unless told otherwise.
@@ -81,45 +73,186 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
     if (typeof threadId === "number") input.message_thread_id = threadId;
     if (index === 0 && typeof replyTo === "number") input.reply_to_message_id = replyTo;
     const sent = await deps.telegram.sendMessage(input);
-    if (!sent.ok) {
-      const ambiguous = sent.ambiguous === true;
-      deps.log({
-        event: ambiguous ? "send_ambiguous" : "send_failed",
-        chat_id: chatId,
-        status: sent.status,
-        sent_parts: messageIds.length,
-        wake_id: auth.wakeId,
-      });
-      // Never retried here. An ambiguous part may be in the chat, so a repeat of this key is refused;
-      // a definite failure frees the key so the caller can send what is missing.
-      if (sendKey) {
-        // If this write fails the claim stays pending, which also refuses a repeat.
-        await (ambiguous
-          ? deps.store.finishSend(sendKey, { state: "ambiguous", message_ids: messageIds }, deps.now(), sendTtlMs)
-          : deps.store.releaseSend(sendKey)
-        ).catch((err: unknown) => {
-          deps.log({ event: "send_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
-        });
-      }
-      // Typing stays on: the answer did not get through. Anything that did clear typing on the clients.
-      if (messageIds.length > 0) await afterMessage(deps, scope, auth.wakeId);
-      return json(502, {
-        ok: false,
-        error: ambiguous ? "telegram_send_ambiguous" : "telegram_send_failed",
-        ambiguous,
-        description: sent.description,
-        sent_parts: messageIds.length,
-        message_ids: messageIds,
-        ...(sent.retryAfter !== undefined ? { retry_after: sent.retryAfter } : {}),
-      });
-    }
+    if (!sent.ok) return failSend(deps, { chatId, auth, scope, reserved, messageIds, sent });
     messageIds.push(sent.messageId);
   }
+  return succeedSend(deps, {
+    chatId,
+    auth,
+    final,
+    requestedWakeId,
+    scope,
+    reserved,
+    messageIds,
+    parts: parts.length,
+    silent,
+  });
+}
 
+interface MediaBody extends SendBody {
+  kind?: unknown;
+  url?: unknown;
+  caption?: unknown;
+  file_name?: unknown;
+}
+
+/**
+ * Send one photo or document. JSON carries an https URL that Telegram downloads.
+ * multipart/form-data uploads the file (field `file`), capped for serverless bodies.
+ * final, reply_to, thread, typing, and idempotency match text /send, and a final
+ * here consumes the same one-final slot.
+ */
+export async function handleSendMedia(request: Request, deps: AppDeps): Promise<Response> {
+  const credential = await authenticate(request, deps);
+  if (!credential.ok) return credential.response;
+  const contentType = (request.headers.get("content-type") ?? "").toLowerCase();
+  const parsed = contentType.startsWith("multipart/form-data")
+    ? await readMediaUpload(request, deps.config.maxMediaBytes)
+    : await readMediaJson(request, deps.config.maxBodyBytes);
+  if (!parsed.ok) return parsed.response;
+  const media = parsed.value;
+
+  const auth = await authorize(credential, deps, media.chatId, media.threadId, { allowClosed: true });
+  if (!auth.ok) return auth.response;
+  const reserved = await reserveSend(deps, auth, media.chatId, media.final, media.idempotencyKey);
+  if (!reserved.ok) return reserved.response;
+
+  const silent = typeof media.disableNotification === "boolean"
+    ? media.disableNotification
+    : auth.wakeId !== null && !media.final;
+  const scope = scopeKey(media.chatId, media.threadId);
+  const input: {
+    chat_id: string;
+    kind: SendMediaKind;
+    url?: string;
+    file?: { bytes: Uint8Array; filename: string; mime: string };
+    caption?: string;
+    message_thread_id?: number;
+    reply_to_message_id?: number;
+    disable_notification?: boolean;
+  } = {
+    chat_id: media.chatId,
+    kind: media.kind,
+    disable_notification: silent,
+  };
+  if (media.caption) input.caption = media.caption;
+  if (media.threadId !== null) input.message_thread_id = media.threadId;
+  if (media.replyTo !== null) input.reply_to_message_id = media.replyTo;
+  if (media.source.type === "url") input.url = media.source.url;
+  else input.file = media.source.file;
+
+  const sent = await deps.telegram.sendMedia(input);
+  if (!sent.ok) return failSend(deps, { chatId: media.chatId, auth, scope, reserved, messageIds: [], sent });
+  return succeedSend(deps, {
+    chatId: media.chatId,
+    auth,
+    final: media.final,
+    requestedWakeId: media.requestedWakeId,
+    scope,
+    reserved,
+    messageIds: [sent.messageId],
+    parts: 1,
+    silent,
+    kind: media.kind,
+  });
+}
+
+interface OpenSend {
+  wakeId: string | null;
+  expiresAtMs: number;
+  closed: boolean;
+}
+
+interface ReservedSend {
+  sendKey: string | null;
+  sendTtlMs: number;
+}
+
+/** One final per wake, and at most one delivery per idempotency_key. Held for the token's life. */
+async function reserveSend(
+  deps: AppDeps,
+  auth: OpenSend,
+  chatId: string,
+  final: boolean,
+  idempotencyKey: string | null,
+): Promise<{ ok: true } & ReservedSend | { ok: false; response: Response }> {
+  const sendKey = auth.wakeId
+    ? final ? `${auth.wakeId}:final` : idempotencyKey ? `${auth.wakeId}:key:${idempotencyKey}` : null
+    : idempotencyKey ? `outbound:${chatId}:${idempotencyKey}` : null;
+  const sendTtlMs = auth.wakeId ? Math.max(1000, auth.expiresAtMs - deps.now()) : deps.config.dedupeTtlMs;
+  const existing = sendKey ? await deps.store.claimSend(sendKey, deps.now(), sendTtlMs) : null;
+  if (existing) return { ok: false, response: repeatedSend(deps, chatId, auth.wakeId, existing) };
+  if (auth.closed) {
+    if (sendKey) await deps.store.releaseSend(sendKey);
+    return { ok: false, response: json(401, { ok: false, error: "wake_closed" }) };
+  }
+  return { ok: true, sendKey, sendTtlMs };
+}
+
+async function failSend(
+  deps: AppDeps,
+  options: {
+    chatId: string;
+    auth: OpenSend;
+    scope: string;
+    reserved: ReservedSend;
+    messageIds: number[];
+    sent: Extract<SendMessageResult, { ok: false }>;
+  },
+): Promise<Response> {
+  const { chatId, auth, scope, reserved, messageIds, sent } = options;
+  const ambiguous = sent.ambiguous === true;
+  deps.log({
+    event: ambiguous ? "send_ambiguous" : "send_failed",
+    chat_id: chatId,
+    status: sent.status,
+    sent_parts: messageIds.length,
+    wake_id: auth.wakeId,
+  });
+  // Never retried here. An ambiguous part may be in the chat, so a repeat of this key is refused;
+  // a definite failure frees the key so the caller can send what is missing.
+  if (reserved.sendKey) {
+    // If this write fails the claim stays pending, which also refuses a repeat.
+    await (ambiguous
+      ? deps.store.finishSend(reserved.sendKey, { state: "ambiguous", message_ids: messageIds }, deps.now(), reserved.sendTtlMs)
+      : deps.store.releaseSend(reserved.sendKey)
+    ).catch((err: unknown) => {
+      deps.log({ event: "send_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
+    });
+  }
+  // Typing stays on: the answer did not get through. Anything that did clear typing on the clients.
+  if (messageIds.length > 0) await afterMessage(deps, scope, auth.wakeId);
+  return json(502, {
+    ok: false,
+    error: ambiguous ? "telegram_send_ambiguous" : "telegram_send_failed",
+    ambiguous,
+    description: sent.description,
+    sent_parts: messageIds.length,
+    message_ids: messageIds,
+    ...(sent.retryAfter !== undefined ? { retry_after: sent.retryAfter } : {}),
+  });
+}
+
+async function succeedSend(
+  deps: AppDeps,
+  options: {
+    chatId: string;
+    auth: OpenSend;
+    final: boolean;
+    requestedWakeId: string | null;
+    scope: string;
+    reserved: ReservedSend;
+    messageIds: number[];
+    parts: number;
+    silent: boolean;
+    kind?: string;
+  },
+): Promise<Response> {
+  const { chatId, auth, final, requestedWakeId, scope, reserved, messageIds, silent } = options;
   // Recorded before anything else, so a repeat is answered with already_sent even if finishing up fails.
-  if (sendKey) {
+  if (reserved.sendKey) {
     try {
-      await deps.store.finishSend(sendKey, { state: "sent", message_ids: messageIds }, deps.now(), sendTtlMs);
+      await deps.store.finishSend(reserved.sendKey, { state: "sent", message_ids: messageIds }, deps.now(), reserved.sendTtlMs);
     } catch (err) {
       // The claim stays pending, so a repeat is refused rather than resent.
       deps.log({ event: "send_record_failed", chat_id: chatId, error: err instanceof Error ? err.name : "error" });
@@ -148,7 +281,15 @@ export async function handleSend(request: Request, deps: AppDeps): Promise<Respo
     await afterMessage(deps, scope, auth.wakeId);
   }
 
-  deps.log({ event: "send", chat_id: chatId, parts: parts.length, final, silent, wake_id: auth.wakeId });
+  deps.log({
+    event: "send",
+    chat_id: chatId,
+    parts: options.parts,
+    final,
+    silent,
+    wake_id: auth.wakeId,
+    ...(options.kind ? { kind: options.kind } : {}),
+  });
   return json(200, { ok: true, message_ids: messageIds });
 }
 
@@ -228,7 +369,7 @@ type Credential =
   | { ok: true; kind: "key" };
 
 /** Check the bearer before reading the body, so unauthenticated callers cannot make us buffer it. */
-async function authenticate(
+export async function authenticate(
   request: Request,
   deps: AppDeps,
 ): Promise<Credential | { ok: false; response: Response }> {
@@ -305,4 +446,136 @@ function normalizeOptionalInt(value: unknown): number | null | "invalid" {
   if (typeof value === "number" && Number.isSafeInteger(value)) return value;
   if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return Number(value);
   return "invalid";
+}
+
+interface MediaCommand {
+  chatId: string;
+  threadId: number | null;
+  replyTo: number | null;
+  final: boolean;
+  requestedWakeId: string | null;
+  idempotencyKey: string | null;
+  disableNotification: boolean | undefined;
+  kind: SendMediaKind;
+  caption: string;
+  source: { type: "url"; url: string } | { type: "file"; file: { bytes: Uint8Array; filename: string; mime: string } };
+}
+
+function mediaKind(value: unknown): SendMediaKind | null {
+  return value === "photo" || value === "document" ? value : null;
+}
+
+function sharedMediaFields(body: MediaBody): { ok: true; fields: Omit<MediaCommand, "kind" | "caption" | "source"> & { kind: SendMediaKind; caption: string } } | { ok: false; response: Response } {
+  const chatId = normalizeId(body.chat_id);
+  const threadId = normalizeOptionalInt(body.message_thread_id);
+  const replyTo = normalizeOptionalInt(body.reply_to_message_id);
+  const kind = mediaKind(body.kind);
+  if (!chatId) return { ok: false, response: json(400, { ok: false, error: "bad_chat_id" }) };
+  if (!kind) return { ok: false, response: json(400, { ok: false, error: "bad_kind" }) };
+  if (threadId === "invalid" || replyTo === "invalid") return { ok: false, response: json(400, { ok: false, error: "bad_message_id" }) };
+  if (body.disable_notification !== undefined && typeof body.disable_notification !== "boolean") {
+    return { ok: false, response: json(400, { ok: false, error: "bad_disable_notification" }) };
+  }
+  if (body.idempotency_key !== undefined && (typeof body.idempotency_key !== "string" || !IDEMPOTENCY_KEY.test(body.idempotency_key))) {
+    return { ok: false, response: json(400, { ok: false, error: "bad_idempotency_key" }) };
+  }
+  const caption = typeof body.caption === "string" ? body.caption : "";
+  if (caption.length > TELEGRAM_CAPTION_LIMIT) {
+    return { ok: false, response: json(413, { ok: false, error: "caption_too_large" }) };
+  }
+  const final = body.final === true;
+  return {
+    ok: true,
+    fields: {
+      chatId,
+      threadId,
+      replyTo,
+      final,
+      requestedWakeId: typeof body.wake_id === "string" && body.wake_id.length <= 80 ? body.wake_id : null,
+      idempotencyKey: typeof body.idempotency_key === "string" ? body.idempotency_key : null,
+      disableNotification: typeof body.disable_notification === "boolean" ? body.disable_notification : undefined,
+      kind,
+      caption,
+    },
+  };
+}
+
+async function readMediaJson(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: MediaCommand } | { ok: false; response: Response }> {
+  const parsed = await readJson(request, maxBytes);
+  if (!parsed.ok) return parsed;
+  const body = parsed.value as MediaBody;
+  const shared = sharedMediaFields(body);
+  if (!shared.ok) return shared;
+  if (typeof body.url !== "string") return { ok: false, response: json(400, { ok: false, error: "bad_media_url" }) };
+  const url = normalizePublicMediaUrl(body.url);
+  if (!url) return { ok: false, response: json(400, { ok: false, error: "bad_media_url" }) };
+  // file_name is not a Bot API field for a URL send. Telegram names the file from the URL.
+  return { ok: true, value: { ...shared.fields, source: { type: "url", url } } };
+}
+
+async function readMediaUpload(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; value: MediaCommand } | { ok: false; response: Response }> {
+  const read = await readLimitedBytes(request, maxBytes);
+  if (!read.ok) return read;
+  const contentType = request.headers.get("content-type") ?? "";
+  let form: FormData;
+  try {
+    form = await new Request(request.url, {
+      method: "POST",
+      headers: { "content-type": contentType },
+      body: read.bytes,
+    }).formData();
+  } catch {
+    return { ok: false, response: json(400, { ok: false, error: "bad_multipart" }) };
+  }
+  const text = (name: string): string | null => {
+    const value = form.get(name);
+    return typeof value === "string" ? value : null;
+  };
+  const finalRaw = text("final");
+  const notifyRaw = text("disable_notification");
+  if (finalRaw !== null && finalRaw !== "" && finalRaw !== "true" && finalRaw !== "false") {
+    return { ok: false, response: json(400, { ok: false, error: "bad_final" }) };
+  }
+  if (notifyRaw !== null && notifyRaw !== "" && notifyRaw !== "true" && notifyRaw !== "false") {
+    return { ok: false, response: json(400, { ok: false, error: "bad_disable_notification" }) };
+  }
+  const body: MediaBody = {
+    chat_id: text("chat_id") ?? undefined,
+    kind: text("kind") ?? undefined,
+    caption: text("caption") ?? undefined,
+    file_name: text("file_name") ?? undefined,
+    message_thread_id: text("message_thread_id") ?? undefined,
+    reply_to_message_id: text("reply_to_message_id") ?? undefined,
+    wake_id: text("wake_id") ?? undefined,
+    idempotency_key: text("idempotency_key") ?? undefined,
+    final: finalRaw === "true",
+    ...(notifyRaw === "true" || notifyRaw === "false" ? { disable_notification: notifyRaw === "true" } : {}),
+  };
+  const shared = sharedMediaFields(body);
+  if (!shared.ok) return shared;
+  const uploaded = form.get("file");
+  if (!(uploaded instanceof File) || uploaded.size <= 0) {
+    return { ok: false, response: json(400, { ok: false, error: "bad_file" }) };
+  }
+  if (uploaded.size > maxBytes) return { ok: false, response: json(413, { ok: false, error: "body_too_large" }) };
+  const named = cleanFileName(typeof body.file_name === "string" ? body.file_name : null)
+    ?? cleanFileName(uploaded.name)
+    ?? (shared.fields.kind === "photo" ? "photo.jpg" : "file");
+  const bytes = new Uint8Array(await uploaded.arrayBuffer());
+  const mime = typeof uploaded.type === "string" && uploaded.type.length > 0 && uploaded.type.length <= 127
+    ? uploaded.type
+    : "application/octet-stream";
+  return {
+    ok: true,
+    value: {
+      ...shared.fields,
+      source: { type: "file", file: { bytes, filename: named, mime } },
+    },
+  };
 }

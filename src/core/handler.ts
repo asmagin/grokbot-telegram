@@ -1,8 +1,9 @@
 import { configStatus } from "./config.js";
 import type { AppDeps } from "./deps.js";
 import { json, routePath } from "./http.js";
+import { handleGetFile } from "./files.js";
 import { handleWebhook } from "./inbound.js";
-import { handleSend, handleTypingHeartbeat, handleTypingStop } from "./outbound.js";
+import { handleSend, handleSendMedia, handleTypingHeartbeat, handleTypingStop } from "./outbound.js";
 
 export async function handleHealth(deps: AppDeps): Promise<Response> {
   const configured = configStatus(deps.config);
@@ -39,12 +40,24 @@ async function route(request: Request, deps: AppDeps): Promise<Response> {
   }
   if (request.method === "POST" && path === "/webhook") return handleWebhook(request, deps);
   if (request.method === "POST" && path === "/send") return handleSend(request, deps);
+  if (request.method === "POST" && path === "/send/media") return handleSendMedia(request, deps);
   if (request.method === "POST" && path === "/typing/stop") return handleTypingStop(request, deps);
   if (request.method === "POST" && path === "/typing/heartbeat") return handleTypingHeartbeat(request, deps);
-  if (["/healthz", "/webhook", "/send", "/typing/stop", "/typing/heartbeat"].includes(path)) {
+  if (path.startsWith("/file/")) {
+    if (request.method !== "GET") return json(405, { ok: false, error: "method_not_allowed" });
+    let token = "";
+    try {
+      token = decodeURIComponent(path.slice("/file/".length));
+    } catch {
+      return json(404, { ok: false, error: "not_found" });
+    }
+    if (!token || token.includes("/")) return json(404, { ok: false, error: "not_found" });
+    return handleGetFile(request, deps, token);
+  }
+  if (["/healthz", "/webhook", "/send", "/send/media", "/typing/stop", "/typing/heartbeat"].includes(path)) {
     return json(405, { ok: false, error: "method_not_allowed" });
   }
   return json(404, { ok: false, error: "not_found" });
 }
 
-export { handleSend, handleTypingHeartbeat, handleTypingStop, handleWebhook };
+export { handleGetFile, handleSend, handleSendMedia, handleTypingHeartbeat, handleTypingStop, handleWebhook };

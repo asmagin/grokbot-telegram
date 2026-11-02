@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createLogger } from "../src/core/log.js";
 import { verifyReplyToken } from "../src/core/crypto.js";
+import { SCHEMA_VERSION } from "../src/core/types.js";
 import { handleRequest } from "../src/core/handler.js";
 import { buildDeps } from "../src/core/deps.js";
 import { telegramMethodUrl } from "../src/core/telegram.js";
@@ -142,7 +143,7 @@ describe("webhook ingress", () => {
       message: { reply_to: { text: string } | null; text: string };
       reply: { token: string; send_url: string; typing_stop_url: string; heartbeat_url: string; chat_id: string };
     };
-    expect(payload.schema_version).toBe(2);
+    expect(payload.schema_version).toBe(SCHEMA_VERSION);
     expect(payload.idempotency_key).toBe("9");
     expect(payload.addressed_how).toBe("private");
     expect(payload.message.reply_to?.text.length).toBe(4000);
