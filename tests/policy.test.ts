@@ -153,11 +153,11 @@ describe("text", () => {
 });
 
 describe("telegram setup bodies", () => {
-  it("registers the webhook with a secret and the message update types", () => {
+  it("registers the webhook with a secret, messages, and callback queries", () => {
     expect(setWebhookBody("https://bridge.example/webhook", "sekrit")).toEqual({
       url: "https://bridge.example/webhook",
       secret_token: "sekrit",
-      allowed_updates: ["message", "edited_message"],
+      allowed_updates: ["message", "edited_message", "callback_query"],
       drop_pending_updates: false,
     });
     expect(setMyCommandsBody().commands.map((command) => command.command)).toEqual(["ask", "help"]);

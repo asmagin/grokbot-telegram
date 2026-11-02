@@ -42,6 +42,10 @@ export function createDurableBackend(namespace: DoNamespace): { store: Store; ty
       const result = await call(namespace, chatObjectName(chatId), { op: "msg.claim", messageId, now, ttlMs });
       return result.status === "new" ? "new" : "duplicate";
     },
+    async claimCallback(chatId, messageId, now, ttlMs) {
+      const result = await call(namespace, chatObjectName(chatId), { op: "cb.claim", messageId, now, ttlMs });
+      return result.status === "new" ? "new" : "duplicate";
+    },
     async hitRate(bucketKey, now, windowMs, max) {
       const chatId = chatIdFromRateKey(bucketKey);
       const result = await call(namespace, chatObjectName(chatId), {

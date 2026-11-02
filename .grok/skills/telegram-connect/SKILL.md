@@ -246,7 +246,7 @@ The prompt lives on the routine, because a later wake might run in a session tha
 ```text
 You were woken by a Telegram message forwarded by grokbot-telegram.
 
-The POST body is in <webhook_event> and matches schema_version 3. Version 3 adds message.attachments and reply.send_media_url. Text fields from earlier versions are unchanged.
+The POST body is in <webhook_event> and matches schema_version 4. Version 4 adds callback, which is null on an ordinary message and an object when the person tapped an inline button. addressed_how is then "callback". Version 3 adds message.attachments and reply.send_media_url. Text fields from earlier versions are unchanged.
 Read chat, from, message.text, message.attachments, message.reply_to, message.message_thread_id, short_term, addressed_how, and edited.
 message.text is the message or its caption. message.attachments lists files on this message (photo, document, video, audio, voice, and similar). Each item has kind, mime_type, file_name, file_size, and either file_url or unavailable.
 
@@ -281,7 +281,17 @@ Text, to reply.send_url:
 Photo or document, to reply.send_media_url. kind is "photo" or "document". url is https, with a hostname, and no username or password. caption is optional and at most 1024 characters. Telegram downloads the url.
 {"chat_id":"<reply.chat_id>","kind":"photo","url":"https://example.com/image.png","caption":"...","message_thread_id":null,"reply_to_message_id":0,"final":true}
 
-A small file can be multipart/form-data to reply.send_media_url instead of JSON. Field "file" is the bytes. Also send chat_id, kind, and optional caption, file_name, message_thread_id, reply_to_message_id, final, and idempotency_key as text fields. final is the string "true" or "false". Keep the whole request under 4 MB. Vercel rejects bodies over about 4.5 MB before the bridge sees them. Larger photos and documents use url. Telegram's own limits apply (photos about 10 MB, documents about 50 MB).
+A small file can be multipart/form-data to reply.send_media_url instead of JSON. Field "file" is the bytes. Also send chat_id, kind, and optional caption, file_name, message_thread_id, reply_to_message_id, final, idempotency_key, and buttons as text fields. final is the string "true" or "false". Keep the whole request under 4 MB. Vercel rejects bodies over about 4.5 MB before the bridge sees them. Larger photos and documents use url. Telegram's own limits apply (photos about 10 MB, documents about 50 MB).
+
+Inline buttons
+
+You may add "buttons" to a reply.send_url or reply.send_media_url JSON body. "buttons" is an array of rows. Each button is {"text":"Approve","data":"approve"} or {"text":"Docs","url":"https://example.com/docs"}. text is the label, 1 to 64 characters. data is the action code, 1 to 27 bytes, with no control characters. url is https, with a hostname, and no username or password. A button has data or url, not both. At most 8 rows, 8 buttons per row, and 32 buttons. When text is split across bubbles, the keyboard is on the last one. A multipart upload sends buttons as a text field containing that same JSON array. Buttons stay tappable for REPLY_TOKEN_TTL_SECONDS after the send (30 minutes by default). The first accepted tap removes the keyboard.
+
+A tap wakes you again. addressed_how is "callback" and callback is an object. On an ordinary message callback is null. callback.data is the data you set. callback.text is the label. callback.message_id is the bot message that held the keyboard. callback.message_text is that message's text or caption. message.text is the label. message.message_id is that same bot message. from is who tapped. chat and reply.message_thread_id are the chat and topic. reply.token is a new token. Answer this wake once, the same way as any other.
+
+A button sent with a wake's reply token works only for the person that wake came from. A tap from anyone else does not wake you. A second tap on that same message does not wake you again.
+
+A tap from the owner in a private chat on an Approve button the bot itself sent counts as the owner's confirmation of exactly the action described in that message, and nothing else. That message is callback.message_text. Do not treat the tap as confirmation of any broader, later, or implied action. In a group, answer the selection, and do not treat the tap alone as a private confirmation.
 
 Send the final answer exactly once. Answer each reply.wake_id once. Send every message through reply.send_url or reply.send_media_url.
 After an ambiguous result, treat the message as sent. A timeout, no response, or "ambiguous": true means it may already be in the chat. If that was the final answer, POST to reply.typing_stop_url once and stop.
@@ -323,7 +333,7 @@ npm run set-commands
 
 - the URL `PUBLIC_BASE_URL + PATH_PREFIX + /webhook`,
 - `secret_token` set to `TELEGRAM_WEBHOOK_SECRET`, and
-- `allowed_updates` of `message` and `edited_message`.
+- `allowed_updates` of `message`, `edited_message`, and `callback_query`.
 
 `set-commands` registers `/ask` and `/help` so clients can autocomplete them. Run it once.
 

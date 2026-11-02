@@ -336,3 +336,14 @@ I checked the tree at HEAD and every line added on the branch (`git log -p main.
 - `fixes.patch` = `git format-patch main..security-review --stdout` (12 patches). Applied with `git am` to a fresh clone of the bundle at `main` (e4067a6): applied cleanly, resulting tree byte-identical to the branch tree, then `npm ci`, lint, typecheck all exit 0 and tests 14 files / 97 passed. Commit SHAs after `git am` differ from the SHAs cited above (new committer timestamps); match by subject.
 - Citation check: all 57 file references in this document resolve to existing files; every `path:line` is within the file's length at the branch HEAD (or at `main` for left items). Spot-checked H-1 and L-21 lines for content.
 - Scrub (tree + all reachable history, and `fixes.patch`): none of the listed names, no `-100…` chat IDs, no bot-token-shaped strings, no real workers.dev/vercel.app subdomains. Informational only: the GitHub owner login appears in the initial commit's author email and a Co-authored-by trailer on `main` (not in the patch).
+
+## Inline keyboards
+
+Added after this review. Not part of the original finding set.
+
+- `callback_data` is HMAC-SHA256, truncated to 16 bytes, over a `cb1` domain separator, the chat id, the owner user id, the expiry, and the action. The chat and the owner are MAC inputs, not stored in the token, so a copied tap fails on any instance without a shared store. Version 2 (operator `OUTBOUND_API_KEY` sends, which have no wake user) omits the owner and is bound to the chat. The allowlist still applies.
+- Reply tokens minted for a wake now include that sender's `user_id`, so the button can be signed for them when `/send` hits a different instance than the webhook. Tokens without `user_id` still verify. Callback buttons on those tokens are refused (`buttons_require_user`). URL buttons are not signed.
+- URL buttons are https only. Credentials, IP literals, localhost, and `api.telegram.org` are rejected. The bridge does not fetch the URL.
+- The first accepted tap claims `(chat, bot message id)` and calls `editMessageReplyMarkup` with an empty keyboard. A second tap is answered "Already chosen." and does not wake. A failed MAC is answered "That button isn't for you." A caller who is not allowlisted gets an empty `answerCallbackQuery` and no wake.
+- The one-tap claim uses the same store as other dedupe: the chat Durable Object on Cloudflare, process memory on Node and Vercel. The signature check does not. On Vercel a second instance can accept a second tap until the keyboard is gone. That matches the existing dedupe limitation. The action itself cannot be forged or replayed into another chat.
+- Button `data` is capped at 27 bytes so the signed blob fits Telegram's 64-byte `callback_data`. Labels are capped at 64 characters. The wake puts the action in `callback.data` and the bot message text in `callback.message_text`. A private-chat Approve tap is defined as confirmation of that message only.

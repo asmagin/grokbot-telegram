@@ -51,6 +51,15 @@ describe("durable object dedupe storage", () => {
     expect(await op(storage, { op: "msg.claim", messageId: 11, now: 5000, ttlMs: 100 })).toEqual({ status: "new" });
   });
 
+  it("claims one inline keyboard per bot message", async () => {
+    const storage = memoryStorage();
+    expect(await op(storage, { op: "cb.claim", messageId: 80, now: 1000, ttlMs: 100 })).toEqual({ status: "new" });
+    expect(await op(storage, { op: "cb.claim", messageId: 80, now: 1050, ttlMs: 100 })).toEqual({ status: "duplicate" });
+    expect(await op(storage, { op: "cb.claim", messageId: 81, now: 1050, ttlMs: 100 })).toEqual({ status: "new" });
+    expect(await op(storage, { op: "cb.claim", now: 1050, ttlMs: 100 })).toEqual({ status: "duplicate" });
+    expect(await op(storage, { op: "cb.claim", messageId: 80, now: 5000, ttlMs: 100 })).toEqual({ status: "new" });
+  });
+
   it("claims a send once, keeps its outcome for the ttl, and frees it on release", async () => {
     const storage = memoryStorage();
     expect(await op(storage, { op: "send.claim", sendKey: "w1:final", now: 1000, ttlMs: 500 })).toEqual({ claimed: true });
