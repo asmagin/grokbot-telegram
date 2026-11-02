@@ -16,6 +16,9 @@ import {
   normalizeEditTail,
   normalizeSendRecord,
   type EditTail,
+  type BurstItem,
+  type BurstStage,
+  type PendingBurst,
   type SendRecord,
 } from "../../core/store.js";
 import type { ContextMessage, TypingScope, TypingStart } from "../../core/types.js";
@@ -46,6 +49,7 @@ interface DoOp {
   max?: number;
   scopeKey?: string;
   message?: ContextMessage;
+  shortTerm?: ContextMessage[];
   limit?: number;
   scope?: TypingScope | null;
   start?: TypingStart;
@@ -56,6 +60,12 @@ interface DoOp {
   tail?: EditTail | null;
   lockKey?: string;
   token?: string;
+  senderKey?: string;
+  debounceMs?: number;
+  maxItems?: number;
+  create?: boolean;
+  generation?: number;
+  item?: BurstItem;
 }
 
 export async function handleDoFetch(
@@ -115,6 +125,12 @@ export async function handleDoFetch(
       return Response.json(await editLock(storage, body));
     case "edit.unlock":
       return Response.json(await editUnlock(storage, body));
+    case "burst.peek":
+      return Response.json(await burstPeek(storage, body));
+    case "burst.stage":
+      return Response.json(await burstStage(storage, body));
+    case "burst.take":
+      return Response.json(await burstTake(storage, body));
     default:
       return Response.json({ ok: false, error: "unknown_op" }, { status: 400 });
   }
@@ -368,6 +384,75 @@ async function sendClaim(storage: DoStorage, body: DoOp): Promise<{ claimed: boo
   await storage.put<StoredSend>(key, { until: now + (body.ttlMs ?? 3_600_000), record: { state: "pending", message_ids: [] } });
   await pruneExpired(storage, "send:", now);
   return { claimed: true };
+}
+
+function burstKey(scopeKey: string): string {
+  return `burst:${scopeKey}`;
+}
+
+async function readBurst(storage: DoStorage, scopeKey: string): Promise<PendingBurst | null> {
+  const value = await storage.get<PendingBurst>(burstKey(scopeKey));
+  if (!value || typeof value.generation !== "number" || !Array.isArray(value.items)) return null;
+  if (typeof value.senderKey !== "string" || typeof value.flushAt !== "number" || !Array.isArray(value.shortTerm)) return null;
+  return value;
+}
+
+async function burstPeek(storage: DoStorage, body: DoOp): Promise<{ burst: { generation: number; senderKey: string; flushAt: number; size: number } | null }> {
+  if (!body.scopeKey) return { burst: null };
+  const burst = await readBurst(storage, body.scopeKey);
+  if (!burst) return { burst: null };
+  return {
+    burst: {
+      generation: burst.generation,
+      senderKey: burst.senderKey,
+      flushAt: burst.flushAt,
+      size: burst.items.length,
+    },
+  };
+}
+
+async function burstStage(storage: DoStorage, body: DoOp): Promise<BurstStage> {
+  const scopeKey = body.scopeKey;
+  const item = body.item;
+  const now = body.now ?? Date.now();
+  const debounceMs = body.debounceMs ?? 0;
+  const maxItems = body.maxItems ?? 8;
+  if (!scopeKey || !item || typeof body.senderKey !== "string") {
+    return { joined: false, generation: 0, delayMs: 0 };
+  }
+  const existing = await readBurst(storage, scopeKey);
+  if (existing && existing.flushAt <= now) {
+    return { joined: false, generation: 0, delayMs: 0, overdueGeneration: existing.generation };
+  }
+  if (existing && existing.senderKey !== body.senderKey) {
+    return { joined: false, generation: 0, delayMs: 0 };
+  }
+  if (!existing) {
+    if (body.create !== true) return { joined: false, generation: 0, delayMs: 0 };
+    const created: PendingBurst = {
+      generation: 1,
+      senderKey: body.senderKey,
+      flushAt: now + debounceMs,
+      shortTerm: Array.isArray(body.shortTerm) ? body.shortTerm : [],
+      items: [item],
+    };
+    await storage.put(burstKey(scopeKey), created);
+    return { joined: true, generation: 1, delayMs: debounceMs };
+  }
+  existing.generation += 1;
+  existing.flushAt = now + debounceMs;
+  existing.items.push(item);
+  while (existing.items.length > maxItems) existing.items.shift();
+  await storage.put(burstKey(scopeKey), existing);
+  return { joined: true, generation: existing.generation, delayMs: debounceMs };
+}
+
+async function burstTake(storage: DoStorage, body: DoOp): Promise<{ burst: PendingBurst | null }> {
+  if (!body.scopeKey || typeof body.generation !== "number") return { burst: null };
+  const existing = await readBurst(storage, body.scopeKey);
+  if (!existing || existing.generation !== body.generation) return { burst: null };
+  await storage.delete(burstKey(body.scopeKey));
+  return { burst: existing };
 }
 
 async function sendFinish(storage: DoStorage, body: DoOp): Promise<{ ok: true }> {

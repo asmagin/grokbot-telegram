@@ -11,6 +11,8 @@ export interface AppDeps {
   telegram: TelegramClient;
   fetchImpl: typeof fetch;
   waitUntil: (promise: Promise<unknown>) => void;
+  /** Wall-clock wait. The forward burst uses this; tests can hold it open. */
+  delay: (ms: number) => Promise<void>;
   now: () => number;
   log: Logger;
 }
@@ -22,6 +24,7 @@ export interface BuildDepsOptions {
   typingMode?: "interval" | "once";
   fetchImpl?: typeof fetch;
   waitUntil?: (promise: Promise<unknown>) => void;
+  delay?: (ms: number) => Promise<void>;
   now?: () => number;
   log?: Logger;
   sleep?: (ms: number) => Promise<void>;
@@ -60,6 +63,7 @@ export function buildDeps(options: BuildDepsOptions): AppDeps {
     waitUntil: options.waitUntil ?? ((promise) => {
       promise.catch(() => undefined);
     }),
+    delay: options.delay ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms))),
     now,
     log,
   };

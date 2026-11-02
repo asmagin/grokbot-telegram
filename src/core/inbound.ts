@@ -3,14 +3,16 @@ import { isAllowlisted } from "./allowlist.js";
 import { callbackButtonText } from "./buttons.js";
 import { canonicalId } from "./config.js";
 import { secretsEqual, verifyCallbackData } from "./crypto.js";
+import { BURST_MAX_ITEMS, BURST_RECOVER_MS, burstSenderKey, clipMessage, selectBurstPrimary } from "./burst.js";
+import { hasForwardMarker } from "./content.js";
 import { safeErrorMessage } from "./log.js";
 import { runInBackground, type AppDeps } from "./deps.js";
 import { forwardToGrok } from "./grok.js";
 import { json, readLimitedBody } from "./http.js";
 import { buildCallbackWakeEvent, buildWakeEvent, toContextMessage } from "./payload.js";
-import { MESSAGE_CLAIM_TTL_MS, rateChatKey, rateUserKey, scopeKey } from "./store.js";
+import { MESSAGE_CLAIM_TTL_MS, rateChatKey, rateUserKey, scopeKey, type PendingBurst } from "./store.js";
 import { cleanLabel, cleanText, fastGreetingReply } from "./text.js";
-import { TELEGRAM_SECRET_HEADER, type TelegramMessage, type TelegramUpdate, type TypingStart } from "./types.js";
+import { TELEGRAM_SECRET_HEADER, type AddressHow, type ContextMessage, type TelegramMessage, type TelegramUpdate, type TypingStart } from "./types.js";
 
 export async function handleWebhook(request: Request, deps: AppDeps): Promise<Response> {
   // Empty, too short, or outside Telegram's secret_token charset all fail closed.
@@ -136,6 +138,40 @@ async function handleClaimedUpdate(
   }
 
   const address = classifyAddress(message, deps.config);
+  // Edits skip the burst: an edit is not the forward-then-comment pair.
+  if (!edited && deps.config.forwardBurstMs > 0) {
+    const plan = await scheduleBurst(deps, {
+      updateId: update.update_id,
+      message,
+      now,
+      chatId,
+      userId,
+      scope,
+      addressed: address.addressed,
+      addressedHow: address.how,
+      command: address.command,
+      shortTerm,
+    });
+    if (plan === "scheduled" || plan === "dropped") return json(200, { ok: true });
+    if (plan === "rated") {
+      return launchWake(deps, {
+        updateId: update.update_id,
+        message,
+        edited,
+        now,
+        chatId,
+        userId,
+        threadId,
+        scope,
+        addressedHow: address.how,
+        command: address.command,
+        shortTerm,
+        burstMessages: [],
+        greet: true,
+      }, "background");
+    }
+  }
+
   if (!address.addressed || !address.how) {
     deps.log({
       event: "update_dropped",
@@ -147,33 +183,213 @@ async function handleClaimedUpdate(
     return json(200, { ok: true });
   }
 
+  if (!await withinRate(deps, update.update_id, chatId, userId, now)) return json(200, { ok: true });
+  return launchWake(deps, {
+    updateId: update.update_id,
+    message,
+    edited,
+    now,
+    chatId,
+    userId,
+    threadId,
+    scope,
+    addressedHow: address.how,
+    command: address.command,
+    shortTerm,
+    burstMessages: [],
+    greet: true,
+  }, "background");
+}
+
+interface WakeLaunch {
+  updateId: number;
+  message: TelegramMessage;
+  edited: boolean;
+  now: number;
+  chatId: string;
+  userId: string | null;
+  threadId: number | null;
+  scope: string;
+  addressedHow: AddressHow | null;
+  command: string | null;
+  shortTerm: ContextMessage[];
+  burstMessages: TelegramMessage[];
+  /** Fast greeting would hide a merged forward, so burst flushes turn it off. */
+  greet: boolean;
+}
+
+/**
+ * Telegram sends a forward and the user's comment as two updates, forward
+ * first, and waits for each webhook response before the next. The 200 goes
+ * out immediately. The wake waits FORWARD_BURST_MS in the background so the
+ * comment can join. The store is shared on Cloudflare (the chat Durable
+ * Object) and on Node. On Vercel it is the memory of one instance, so a
+ * second instance still produces two wakes.
+ */
+async function scheduleBurst(
+  deps: AppDeps,
+  input: {
+    updateId: number;
+    message: TelegramMessage;
+    now: number;
+    chatId: string;
+    userId: string | null;
+    scope: string;
+    addressed: boolean;
+    addressedHow: AddressHow | null;
+    command: string | null;
+    shortTerm: ContextMessage[];
+  },
+): Promise<"scheduled" | "dropped" | "passthrough" | "rated"> {
+  await recoverOverdue(deps, input.scope, input.now);
+  const forward = hasForwardMarker(input.message);
+  const senderKey = burstSenderKey(input.message);
+  const open = await deps.store.peekBurst(input.scope);
+  const sameSender = Boolean(
+    open && open.flushAt > input.now && open.senderKey === senderKey && senderKey !== "unknown",
+  );
+  const join = sameSender && (forward || input.addressed);
+  // A forward while someone else's burst is open must not replace it.
+  const openOwn = !open || open.flushAt <= input.now || sameSender;
+  if (!join && !(forward && openOwn)) return "passthrough";
+
+  let rated = false;
+  if (input.addressed) {
+    if (!await withinRate(deps, input.updateId, input.chatId, input.userId, input.now)) return "dropped";
+    rated = true;
+  }
+
+  const stage = () => deps.store.stageBurst({
+    scopeKey: input.scope,
+    item: {
+      updateId: input.updateId,
+      addressedHow: input.addressedHow,
+      command: input.command,
+      message: clipMessage(input.message),
+    },
+    shortTerm: input.shortTerm,
+    senderKey,
+    now: input.now,
+    debounceMs: deps.config.forwardBurstMs,
+    maxItems: BURST_MAX_ITEMS,
+    create: !join,
+  });
+
+  let staged = await stage();
+  if (staged.overdueGeneration !== undefined) {
+    const old = await deps.store.takeBurst(input.scope, staged.overdueGeneration);
+    if (old) deliverRecovered(deps, input.scope, old, input.now);
+    staged = await stage();
+  }
+  if (!staged.joined) return rated ? "rated" : "passthrough";
+
+  armBurst(deps, input.scope, staged.generation, staged.delayMs);
+  deps.log({
+    event: "burst_armed",
+    update_id: input.updateId,
+    chat_id: input.chatId,
+    generation: staged.generation,
+    delay_ms: staged.delayMs,
+  });
+  return "scheduled";
+}
+
+function deliverRecovered(deps: AppDeps, scope: string, burst: PendingBurst, now: number): void {
+  if (burst.flushAt < now - BURST_RECOVER_MS) {
+    deps.log({ event: "burst_dropped", reason: "expired", scope });
+    return;
+  }
+  runInBackground(deps, "burst_flush_failed", () => emitBurst(deps, scope, burst));
+}
+
+async function recoverOverdue(deps: AppDeps, scope: string, now: number): Promise<void> {
+  const open = await deps.store.peekBurst(scope);
+  if (!open || open.flushAt > now) return;
+  const old = await deps.store.takeBurst(scope, open.generation);
+  if (!old) return;
+  deliverRecovered(deps, scope, old, now);
+}
+
+function armBurst(deps: AppDeps, scope: string, generation: number, delayMs: number): void {
+  runInBackground(deps, "burst_flush_failed", async () => {
+    await deps.delay(delayMs);
+    const burst = await deps.store.takeBurst(scope, generation);
+    if (!burst) return;
+    await emitBurst(deps, scope, burst);
+  });
+}
+
+async function emitBurst(deps: AppDeps, scope: string, burst: PendingBurst): Promise<void> {
+  const primary = selectBurstPrimary(burst.items);
+  if (!primary?.addressedHow) {
+    deps.log({
+      event: "burst_dropped",
+      reason: "not_addressed",
+      scope,
+      update_ids: burst.items.map((item) => item.updateId),
+    });
+    return;
+  }
+  const message = primary.message;
+  const chatId = String(message.chat.id);
+  const sender = senderUser(message);
+  await launchWake(deps, {
+    updateId: primary.updateId,
+    message,
+    edited: false,
+    now: deps.now(),
+    chatId,
+    userId: sender ? String(sender.id) : null,
+    threadId: topicThreadId(message),
+    scope,
+    addressedHow: primary.addressedHow,
+    command: primary.command,
+    shortTerm: burst.shortTerm,
+    burstMessages: burst.items.filter((item) => item.updateId !== primary.updateId).map((item) => item.message),
+    greet: false,
+  }, "inline");
+}
+
+async function withinRate(
+  deps: AppDeps,
+  updateId: number,
+  chatId: string,
+  userId: string | null,
+  now: number,
+): Promise<boolean> {
   const chatRate = await deps.store.hitRate(rateChatKey(chatId), now, deps.config.rateLimitWindowMs, deps.config.rateLimitMax);
   const userRate = userId
     ? await deps.store.hitRate(rateUserKey(chatId, userId), now, deps.config.rateLimitWindowMs, deps.config.rateLimitMax)
     : { allowed: true, count: 0 };
-  if (!chatRate.allowed || !userRate.allowed) {
-    deps.log({
-      event: "update_dropped",
-      reason: "rate_limited",
-      update_id: update.update_id,
-      chat_id: chatId,
-      user_id: userId,
-    });
-    return json(200, { ok: true });
-  }
+  if (chatRate.allowed && userRate.allowed) return true;
+  deps.log({
+    event: "update_dropped",
+    reason: "rate_limited",
+    update_id: updateId,
+    chat_id: chatId,
+    user_id: userId,
+  });
+  return false;
+}
 
-  const greeting = deps.config.fastGreeting
+async function launchWake(deps: AppDeps, options: WakeLaunch, delivery: "background" | "inline"): Promise<Response> {
+  const { message } = options;
+  if (!options.addressedHow) return json(200, { ok: true });
+  // A forwarded "hi" is the content, not a greeting to swallow.
+  const greeting = options.greet && !hasForwardMarker(message) && deps.config.fastGreeting
     ? fastGreetingReply(messageText(message), deps.config.telegramBotUsername)
     : null;
   if (greeting) {
-    if (!await claimMessage(deps, update.update_id, chatId, message.message_id, edited, now)) return json(200, { ok: true });
-    deps.log({ event: "fast_greeting", update_id: update.update_id, chat_id: chatId });
+    if (!await claimMessage(deps, options.updateId, options.chatId, message.message_id, options.edited, options.now)) {
+      return json(200, { ok: true });
+    }
+    deps.log({ event: "fast_greeting", update_id: options.updateId, chat_id: options.chatId });
     runInBackground(deps, "fast_greeting_failed", async () => {
       await deps.telegram.sendMessage({
-        chat_id: chatId,
+        chat_id: options.chatId,
         text: greeting,
         reply_to_message_id: message.message_id,
-        ...(threadId !== null ? { message_thread_id: threadId } : {}),
+        ...(options.threadId !== null ? { message_thread_id: options.threadId } : {}),
       });
     });
     return json(200, { ok: true });
@@ -182,12 +398,13 @@ async function handleClaimedUpdate(
   const wake = await buildWakeEvent({
     config: deps.config,
     message,
-    edited,
-    updateId: update.update_id,
-    addressedHow: address.how,
-    command: address.command,
-    shortTerm,
-    nowMs: now,
+    edited: options.edited,
+    updateId: options.updateId,
+    addressedHow: options.addressedHow,
+    command: options.command,
+    shortTerm: options.shortTerm,
+    burstMessages: options.burstMessages,
+    nowMs: options.now,
   });
   if (!wake) {
     deps.log({
@@ -196,20 +413,24 @@ async function handleClaimedUpdate(
       reason: "reply_not_configured",
       missing_or_invalid: ["REPLY_TOKEN_SECRET", "PUBLIC_BASE_URL"].filter((name) =>
         name === "REPLY_TOKEN_SECRET" ? !deps.config.replyTokenSecret : !deps.config.publicBaseUrl),
-      update_id: update.update_id,
-      chat_id: chatId,
+      update_id: options.updateId,
+      chat_id: options.chatId,
     });
     return json(200, { ok: true });
   }
 
-  if (!await claimMessage(deps, update.update_id, chatId, message.message_id, edited, now)) return json(200, { ok: true });
+  if (!await claimMessage(deps, options.updateId, options.chatId, message.message_id, options.edited, options.now)) {
+    return json(200, { ok: true });
+  }
+  for (const extra of options.burstMessages) {
+    await claimMessage(deps, options.updateId, options.chatId, extra.message_id, false, options.now, true);
+  }
 
-  // Typing is pointless once the reply token has expired, so the ceiling never outlives it.
   const tokenExpiry = Date.parse(wake.reply.expires_at);
   const session: TypingStart = {
-    scopeKey: scope,
-    chatId,
-    threadId,
+    scopeKey: options.scope,
+    chatId: options.chatId,
+    threadId: options.threadId,
     refreshMs: deps.config.typingRefreshMs,
     wakeId: wake.reply.wake_id,
     messageId: message.message_id,
@@ -217,23 +438,26 @@ async function handleClaimedUpdate(
     // Optional private-chat preview, off by default. It is not the progress
     // message: a draft has no message_id, so /send/edit cannot turn it into the answer.
     draft: deps.config.draftPlaceholder && message.chat.type === "private",
-    startedAt: now,
+    startedAt: options.now,
     leaseMs: deps.config.typingLeaseMs,
     deadline: Number.isFinite(tokenExpiry)
-      ? Math.min(now + deps.config.typingMaxMs, tokenExpiry)
-      : now + deps.config.typingMaxMs,
+      ? Math.min(options.now + deps.config.typingMaxMs, tokenExpiry)
+      : options.now + deps.config.typingMaxMs,
   };
 
   deps.log({
     event: "wake",
-    update_id: update.update_id,
-    chat_id: chatId,
-    user_id: userId,
-    addressed_how: address.how,
-    edited,
+    update_id: options.updateId,
+    chat_id: options.chatId,
+    user_id: options.userId,
+    addressed_how: options.addressedHow,
+    edited: options.edited,
+    ...(options.burstMessages.length > 0 ? { burst_size: options.burstMessages.length } : {}),
   });
 
-  runInBackground(deps, "wake_background_failed", () => deliverWake(deps, message, session, wake, chatId, threadId, true));
+  const deliver = () => deliverWake(deps, message, session, wake, options.chatId, options.threadId, true);
+  if (delivery === "inline") await deliver();
+  else runInBackground(deps, "wake_background_failed", deliver);
   return json(200, { ok: true });
 }
 
@@ -472,12 +696,15 @@ async function claimMessage(
   messageId: number,
   edited: boolean,
   now: number,
+  quiet = false,
 ): Promise<boolean> {
   const claim = await deps.store.claimMessage(chatId, messageId, now, MESSAGE_CLAIM_TTL_MS);
   if (claim === "new") return true;
-  deps.log(edited
-    ? { event: "edit_ignored", update_id: updateId, chat_id: chatId, message_id: messageId }
-    : { event: "update_dropped", reason: "duplicate_message", update_id: updateId, chat_id: chatId, message_id: messageId });
+  if (!quiet) {
+    deps.log(edited
+      ? { event: "edit_ignored", update_id: updateId, chat_id: chatId, message_id: messageId }
+      : { event: "update_dropped", reason: "duplicate_message", update_id: updateId, chat_id: chatId, message_id: messageId });
+  }
   return false;
 }
 

@@ -58,6 +58,8 @@ export interface TelegramEntity {
   type: string;
   offset: number;
   length: number;
+  /** Present on `text_link` entities. The visible label is the text slice. */
+  url?: string;
 }
 
 export interface TelegramMessage {
@@ -74,6 +76,10 @@ export interface TelegramMessage {
   is_automatic_forward?: boolean;
   sender_chat?: TelegramChat;
   reply_to_message?: TelegramMessage;
+  /** Partial quote of the message being replied to. */
+  quote?: unknown;
+  /** Reply whose parent is in another chat, or is not included in full. */
+  external_reply?: unknown;
   migrate_to_chat_id?: number;
   migrate_from_chat_id?: number;
   photo?: unknown[];
@@ -86,7 +92,16 @@ export interface TelegramMessage {
   video_note?: unknown;
   contact?: unknown;
   location?: unknown;
+  venue?: unknown;
   poll?: unknown;
+  /** Bot API 7+. Replaces the legacy forward_* fields, which may still arrive. */
+  forward_origin?: unknown;
+  forward_from?: TelegramUser;
+  forward_from_chat?: TelegramChat;
+  forward_from_message_id?: number;
+  forward_signature?: string;
+  forward_sender_name?: string;
+  forward_date?: number;
   /** Present when this message carries an inline keyboard. */
   reply_markup?: TelegramReplyMarkup;
 }
@@ -133,10 +148,118 @@ export interface ContextMessage {
   from: PublicUser | null;
 }
 
+/** A URL from a Telegram `url` or `text_link` entity. The bridge does not fetch it. */
+export interface WakeLink {
+  kind: "url" | "text_link";
+  url: string;
+  /** Visible label for a text_link. Null for a plain url entity. */
+  text: string | null;
+}
+
+/**
+ * Where a forwarded message came from. Names and titles are untrusted.
+ * `date` is the original message's unix time.
+ */
+export interface WakeForwardOrigin {
+  type: "user" | "hidden_user" | "chat" | "channel";
+  date: number | null;
+  sender_name: string | null;
+  username: string | null;
+  chat_title: string | null;
+  /** Original message id when the origin is a channel and Telegram sent one. */
+  message_id: number | null;
+}
+
+export interface WakeContact {
+  phone_number: string | null;
+  first_name: string | null;
+  last_name: string | null;
+  user_id: string | null;
+}
+
+export interface WakeLocation {
+  latitude: number;
+  longitude: number;
+  horizontal_accuracy: number | null;
+  live_period: number | null;
+}
+
+export interface WakeVenue {
+  title: string | null;
+  address: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  foursquare_id: string | null;
+  google_place_id: string | null;
+}
+
+export interface WakePollOption {
+  text: string;
+  voter_count: number | null;
+}
+
+export interface WakePoll {
+  question: string;
+  type: "regular" | "quiz" | "unknown";
+  options: WakePollOption[];
+  total_voter_count: number | null;
+  is_closed: boolean;
+  is_anonymous: boolean;
+  allows_multiple_answers: boolean;
+  correct_option_id: number | null;
+}
+
+/** The highlighted fragment of a reply. `position` is a UTF-16 offset into the parent. */
+export interface WakeQuote {
+  text: string;
+  position: number | null;
+  is_manual: boolean;
+}
+
+/** A reply to a message outside this chat. Telegram does not include that message's text. */
+export interface WakeExternalReply {
+  origin: WakeForwardOrigin | null;
+  chat_title: string | null;
+  chat_username: string | null;
+  message_id: number | null;
+  media: string[];
+  attachments: WakeAttachment[];
+  contact: WakeContact | null;
+  location: WakeLocation | null;
+  venue: WakeVenue | null;
+  poll: WakePoll | null;
+}
+
 export interface ReplyTo {
   message_id: number;
   text: string;
   from: PublicUser | null;
+  media: string[];
+  attachments: WakeAttachment[];
+  links: WakeLink[];
+  contact: WakeContact | null;
+  location: WakeLocation | null;
+  venue: WakeVenue | null;
+  poll: WakePoll | null;
+}
+
+/**
+ * An earlier Telegram update folded into this wake. Present when a forward and
+ * the sender's following comment were merged. Untrusted, same as `message`.
+ */
+export interface WakeBurstItem {
+  message_id: number;
+  text: string;
+  date: number | null;
+  from: PublicUser | null;
+  media: string[];
+  attachments: WakeAttachment[];
+  links: WakeLink[];
+  forward: WakeForwardOrigin | null;
+  contact: WakeContact | null;
+  location: WakeLocation | null;
+  venue: WakeVenue | null;
+  poll: WakePoll | null;
 }
 
 export interface WakeReply {
@@ -206,6 +329,17 @@ export interface WakeEvent {
     message_thread_id: number | null;
     media: string[];
     attachments: WakeAttachment[];
+    /** Set when this message itself is a forward. */
+    forward: WakeForwardOrigin | null;
+    links: WakeLink[];
+    quote: WakeQuote | null;
+    external_reply: WakeExternalReply | null;
+    contact: WakeContact | null;
+    location: WakeLocation | null;
+    venue: WakeVenue | null;
+    poll: WakePoll | null;
+    /** Earlier updates merged into this wake. Empty when this wake is one update. */
+    burst: WakeBurstItem[];
     reply_to: ReplyTo | null;
   };
   /** Null when this wake is a message. An object when it is a button tap. */

@@ -119,6 +119,48 @@ describe("durable object dedupe storage", () => {
     expect(await storage.get("wakes")).toBeUndefined();
   });
 
+  it("stages a forward burst for one sender and lets only the latest generation take it", async () => {
+    const storage = memoryStorage();
+    const item = (id: number, text: string) => ({
+      updateId: id,
+      addressedHow: "private",
+      command: null,
+      message: { message_id: id, text, chat: { id: 1, type: "private" }, from: { id: 1, first_name: "A" } },
+    });
+    const scopeKey = "chat:1:thread:root";
+    const opened = await op(storage, {
+      op: "burst.stage", scopeKey, item: item(1, "a"),
+      shortTerm: [{ message_id: 9, text: "prior", date: 1, message_thread_id: null, from: null }],
+      senderKey: "user:1", now: 1000, debounceMs: 1500, maxItems: 8, create: true,
+    });
+    expect(opened).toMatchObject({ joined: true, generation: 1, delayMs: 1500 });
+    expect(await op(storage, {
+      op: "burst.stage", scopeKey, item: item(2, "nope"), shortTerm: [], senderKey: "user:2",
+      now: 1100, debounceMs: 1500, maxItems: 8, create: true,
+    })).toMatchObject({ joined: false });
+    const joined = await op(storage, {
+      op: "burst.stage", scopeKey, item: item(3, "b"), shortTerm: [],
+      senderKey: "user:1", now: 1200, debounceMs: 1500, maxItems: 2, create: false,
+    });
+    expect(joined.generation).toBe(2);
+    const peek = await op(storage, { op: "burst.peek", scopeKey });
+    expect(peek.burst).toMatchObject({ generation: 2, senderKey: "user:1", size: 2 });
+    expect(await op(storage, { op: "burst.take", scopeKey, generation: 1 })).toEqual({ burst: null });
+    const taken = await op(storage, { op: "burst.take", scopeKey, generation: 2 });
+    const burst = taken.burst as { items: { message: { text: string } }[]; shortTerm: unknown[] };
+    expect(burst.items.map((entry) => entry.message.text)).toEqual(["a", "b"]);
+    expect(burst.shortTerm).toHaveLength(1);
+    expect(await op(storage, { op: "burst.take", scopeKey, generation: 2 })).toEqual({ burst: null });
+    const stale = await op(storage, {
+      op: "burst.stage", scopeKey, item: item(4, "old"), shortTerm: [], senderKey: "user:1",
+      now: 1000, debounceMs: 500, maxItems: 8, create: true,
+    });
+    expect(await op(storage, {
+      op: "burst.stage", scopeKey, item: item(5, "late"), shortTerm: [], senderKey: "user:1",
+      now: 2000, debounceMs: 500, maxItems: 8, create: true,
+    })).toMatchObject({ joined: false, overdueGeneration: stale.generation });
+  });
+
   it("does not attach context older than a week", async () => {
     const storage = memoryStorage();
     const day = 86_400;

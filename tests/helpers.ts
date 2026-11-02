@@ -86,6 +86,7 @@ export function createTestApp(options: {
   fetchImpl?: typeof fetch;
   now?: number;
   sleep?: (ms: number) => Promise<void>;
+  delay?: (ms: number) => Promise<void>;
 } = {}): { deps: AppDeps; tasks: Promise<unknown>[]; calls: RecordedCall[] } {
   const mock = createFetchMock();
   const tasks: Promise<unknown>[] = [];
@@ -94,6 +95,7 @@ export function createTestApp(options: {
     fetchImpl: options.fetchImpl ?? mock.fetchImpl,
     now: () => options.now ?? NOW,
     sleep: options.sleep ?? (async () => undefined),
+    ...(options.delay ? { delay: options.delay } : {}),
     waitUntil(promise) {
       tasks.push(promise);
     },

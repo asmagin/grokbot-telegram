@@ -1,5 +1,14 @@
 import type { ContextMessage } from "../../core/types.js";
-import { chatIdFromRateKey, chatIdFromScope, normalizeEditTail, normalizeSendRecord, type Store } from "../../core/store.js";
+import {
+  chatIdFromRateKey,
+  chatIdFromScope,
+  normalizeSendRecord,
+  normalizeEditTail,
+  type BurstPeek,
+  type BurstStage,
+  type PendingBurst,
+  type Store,
+} from "../../core/store.js";
 import { normalizeScope, type TypingController } from "../../core/typing.js";
 
 export interface DoId {
@@ -22,6 +31,40 @@ async function call(namespace: DoNamespace, name: string, body: Record<string, u
   });
   if (!response.ok) throw new Error(`durable_object_${response.status}`);
   return (await response.json()) as Record<string, unknown>;
+}
+
+function asBurstPeek(value: unknown): BurstPeek | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.generation !== "number" || typeof record.senderKey !== "string" || typeof record.flushAt !== "number") {
+    return null;
+  }
+  return {
+    generation: record.generation,
+    senderKey: record.senderKey,
+    flushAt: record.flushAt,
+    size: typeof record.size === "number" ? record.size : 0,
+  };
+}
+
+function asBurstStage(value: Record<string, unknown>): BurstStage {
+  const stage: BurstStage = {
+    joined: value.joined === true,
+    generation: typeof value.generation === "number" ? value.generation : 0,
+    delayMs: typeof value.delayMs === "number" ? value.delayMs : 0,
+  };
+  if (typeof value.overdueGeneration === "number") stage.overdueGeneration = value.overdueGeneration;
+  return stage;
+}
+
+function asPendingBurst(value: unknown): PendingBurst | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.generation !== "number" || typeof record.senderKey !== "string" || typeof record.flushAt !== "number") {
+    return null;
+  }
+  if (!Array.isArray(record.items) || !Array.isArray(record.shortTerm)) return null;
+  return record as unknown as PendingBurst;
 }
 
 function chatObjectName(chatId: string): string {
@@ -121,6 +164,35 @@ export function createDurableBackend(namespace: DoNamespace): { store: Store; ty
     },
     async releaseEditLock(key, token) {
       await call(namespace, "dedupe", { op: "edit.unlock", lockKey: key, token });
+    },
+    async peekBurst(scope) {
+      const result = await call(namespace, chatObjectName(chatIdFromScope(scope)), {
+        op: "burst.peek",
+        scopeKey: scope,
+      });
+      return asBurstPeek(result.burst);
+    },
+    async stageBurst(input) {
+      const result = await call(namespace, chatObjectName(chatIdFromScope(input.scopeKey)), {
+        op: "burst.stage",
+        scopeKey: input.scopeKey,
+        item: input.item,
+        shortTerm: input.shortTerm,
+        senderKey: input.senderKey,
+        now: input.now,
+        debounceMs: input.debounceMs,
+        maxItems: input.maxItems,
+        create: input.create,
+      });
+      return asBurstStage(result);
+    },
+    async takeBurst(scope, generation) {
+      const result = await call(namespace, chatObjectName(chatIdFromScope(scope)), {
+        op: "burst.take",
+        scopeKey: scope,
+        generation,
+      });
+      return asPendingBurst(result.burst);
     },
   };
 

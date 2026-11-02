@@ -1,5 +1,38 @@
-import type { ContextMessage, TypingScope } from "./types.js";
+import type { AddressHow, ContextMessage, TelegramMessage, TypingScope } from "./types.js";
 import { scopeDeadline } from "./typing.js";
+
+/** One Telegram update held while a forward burst is still open. */
+export interface BurstItem {
+  updateId: number;
+  addressedHow: AddressHow | null;
+  command: string | null;
+  message: TelegramMessage;
+}
+
+/** Per chat and forum topic. The flush that still matches `generation` delivers it. */
+export interface PendingBurst {
+  generation: number;
+  senderKey: string;
+  flushAt: number;
+  /** Context captured before the first item in the burst was part of it. */
+  shortTerm: ContextMessage[];
+  items: BurstItem[];
+}
+
+export interface BurstPeek {
+  generation: number;
+  senderKey: string;
+  flushAt: number;
+  size: number;
+}
+
+export interface BurstStage {
+  joined: boolean;
+  generation: number;
+  delayMs: number;
+  /** An older burst is past its flush time. Take this generation, then stage again. */
+  overdueGeneration?: number;
+}
 
 export interface Store {
   claimUpdate(updateId: number, now: number, ttlMs: number): Promise<"new" | "duplicate">;
@@ -59,6 +92,27 @@ export interface Store {
    */
   claimEditLock(key: string, now: number, ttlMs: number): Promise<string | null>;
   releaseEditLock(key: string, token: string): Promise<void>;
+  /** The open forward burst in this chat and topic, or null. */
+  peekBurst(scopeKey: string): Promise<BurstPeek | null>;
+  /**
+   * Open a burst or append to the one from the same sender.
+   * Read-modify-write stays inside this call so two updates cannot lose an item.
+   */
+  stageBurst(input: {
+    scopeKey: string;
+    item: BurstItem;
+    shortTerm: ContextMessage[];
+    senderKey: string;
+    now: number;
+    debounceMs: number;
+    maxItems: number;
+    create: boolean;
+  }): Promise<BurstStage>;
+  /**
+   * Remove the burst when `generation` is still current. A newer message bumps
+   * the generation, so the earlier waiter gets null and does not deliver.
+   */
+  takeBurst(scopeKey: string, generation: number): Promise<PendingBurst | null>;
 }
 
 /** Message ids already sent after an edited first chunk, when the rest of a final edit did not finish. */
@@ -176,6 +230,7 @@ export class MemoryStore implements Store {
   private readonly sends = new Map<string, { until: number; record: SendRecord }>();
   private readonly outbound = new Map<string, { until: number; ids: number[]; tail: EditTail | null }>();
   private readonly editLocks = new Map<string, { until: number; token: string }>();
+  private readonly bursts = new Map<string, PendingBurst>();
 
   async claimUpdate(updateId: number, now: number, ttlMs: number): Promise<"new" | "duplicate"> {
     this.pruneUpdates(now);
@@ -345,6 +400,70 @@ export class MemoryStore implements Store {
     }
     const entry = this.outbound.get(wakeId);
     return entry && entry.until > now ? entry : null;
+  }
+
+  async peekBurst(scopeKey: string): Promise<BurstPeek | null> {
+    const burst = this.bursts.get(scopeKey);
+    if (!burst) return null;
+    return { generation: burst.generation, senderKey: burst.senderKey, flushAt: burst.flushAt, size: burst.items.length };
+  }
+
+  async stageBurst(input: {
+    scopeKey: string;
+    item: BurstItem;
+    shortTerm: ContextMessage[];
+    senderKey: string;
+    now: number;
+    debounceMs: number;
+    maxItems: number;
+    create: boolean;
+  }): Promise<BurstStage> {
+    const existing = this.bursts.get(input.scopeKey);
+    if (existing && existing.flushAt <= input.now) {
+      return { joined: false, generation: 0, delayMs: 0, overdueGeneration: existing.generation };
+    }
+    if (existing && existing.senderKey !== input.senderKey) {
+      return { joined: false, generation: 0, delayMs: 0 };
+    }
+    if (!existing) {
+      if (!input.create) return { joined: false, generation: 0, delayMs: 0 };
+      const created: PendingBurst = {
+        generation: 1,
+        senderKey: input.senderKey,
+        flushAt: input.now + input.debounceMs,
+        shortTerm: input.shortTerm,
+        items: [input.item],
+      };
+      this.rememberBurst(input.scopeKey, created, input.now);
+      return { joined: true, generation: 1, delayMs: input.debounceMs };
+    }
+    existing.generation += 1;
+    existing.flushAt = input.now + input.debounceMs;
+    existing.items.push(input.item);
+    while (existing.items.length > input.maxItems) existing.items.shift();
+    this.rememberBurst(input.scopeKey, existing, input.now);
+    return { joined: true, generation: existing.generation, delayMs: input.debounceMs };
+  }
+
+  async takeBurst(scopeKey: string, generation: number): Promise<PendingBurst | null> {
+    const existing = this.bursts.get(scopeKey);
+    if (!existing || existing.generation !== generation) return null;
+    this.bursts.delete(scopeKey);
+    return structuredClone(existing);
+  }
+
+  /** Least-recently-used order, dropping bursts whose waiter is long gone. */
+  private rememberBurst(scopeKey: string, burst: PendingBurst, now: number): void {
+    this.bursts.delete(scopeKey);
+    this.bursts.set(scopeKey, burst);
+    for (const [key, value] of this.bursts) {
+      if (key !== scopeKey && value.flushAt < now - 60_000) this.bursts.delete(key);
+    }
+    while (this.bursts.size > MAX_MEMORY_SCOPES) {
+      const oldest = this.bursts.keys().next().value;
+      if (oldest === undefined || oldest === scopeKey) break;
+      this.bursts.delete(oldest);
+    }
   }
 
   private pruneUpdates(now: number): void {
